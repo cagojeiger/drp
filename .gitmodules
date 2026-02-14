@@ -1,0 +1,3 @@
+[submodule ".repos/frp"]
+	path = .repos/frp
+	url = https://github.com/fatedier/frp
