@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# run_test.sh — Automated test for drp POC (H1/H2/H3/F5)
+# run_test.sh — drp POC integration tests
 #
-# Topology:  C → B → A (linear mesh)
-#            drpc → A (client registered on A)
-#            local HTTP server on :5000
+# Phase 1: Linear mesh (A—B—C)     → H1, H2, H3, F1, F2
+# Phase 2: Triangle mesh (A—B—C—A) → F5 (broadcast loop prevention)
 #
 # Run:  bash poc/run_test.sh
 
@@ -13,20 +12,34 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 LOG_DIR="$SCRIPT_DIR/.logs"
+rm -rf "$LOG_DIR"
 mkdir -p "$LOG_DIR"
 
 PIDS=()
 PASS=0
 FAIL=0
+LOCAL_PORT=15000
+
+BACKEND_DIR=$(mktemp -d)
+echo "drp-poc-ok" >"$BACKEND_DIR/index.html"
 
 cleanup() {
 	for pid in "${PIDS[@]}"; do
 		kill "$pid" 2>/dev/null || true
 	done
 	wait 2>/dev/null || true
-	[ -n "${BACKEND_DIR:-}" ] && rm -rf "$BACKEND_DIR" 2>/dev/null || true
+	rm -rf "$BACKEND_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+kill_all() {
+	for pid in "${PIDS[@]}"; do
+		kill "$pid" 2>/dev/null || true
+	done
+	wait 2>/dev/null || true
+	PIDS=()
+	sleep 0.5
+}
 
 # Colors
 RED='\033[0;31m'
@@ -56,113 +69,189 @@ wait_port() {
 	return 1
 }
 
+http_status() {
+	curl -s -o /dev/null -w "%{http_code}" "$@" || echo "000"
+}
+
 echo -e "${BOLD}=== drp POC Test ===${NC}"
+
+# =========================================================
+# Phase 1: Linear Mesh — H1, H2, H3, F1, F2
+# Topology:  A — B — C  (no cycle)
+#            drpc → A
+# =========================================================
+echo
+echo -e "${BOLD}--- Phase 1: Linear Mesh (A—B—C) ---${NC}"
 echo
 
-# -------------------------------------------------------
-# 1. Local HTTP server (simulates backend)
-# -------------------------------------------------------
-BACKEND_DIR=$(mktemp -d)
-echo "drp-poc-ok" >"$BACKEND_DIR/index.html"
-LOCAL_PORT=15000
-echo -e "${YELLOW}Starting local HTTP server on :${LOCAL_PORT}${NC}"
-python3 -m http.server "$LOCAL_PORT" --directory "$BACKEND_DIR" >"$LOG_DIR/local.log" 2>&1 &
+# Backend
+echo -e "${YELLOW}  backend :${LOCAL_PORT}${NC}"
+python3 -m http.server "$LOCAL_PORT" --directory "$BACKEND_DIR" \
+	>"$LOG_DIR/local.log" 2>&1 &
 PIDS+=($!)
 wait_port "$LOCAL_PORT"
 
-# -------------------------------------------------------
-# 2. drps servers (A-B-C linear mesh)
-# -------------------------------------------------------
-echo -e "${YELLOW}Starting drps-A on :8001/:9001${NC}"
+# Servers
+echo -e "${YELLOW}  drps-A :8001/:9001${NC}"
 python3 drps.py --node-id A --http-port 8001 --control-port 9001 -v \
 	>"$LOG_DIR/drps-A.log" 2>&1 &
 PIDS+=($!)
 wait_port 9001
 
-echo -e "${YELLOW}Starting drps-B on :8002/:9002 (peer→A)${NC}"
+echo -e "${YELLOW}  drps-B :8002/:9002 (peer→A)${NC}"
 python3 drps.py --node-id B --http-port 8002 --control-port 9002 \
 	--peers localhost:9001 -v >"$LOG_DIR/drps-B.log" 2>&1 &
 PIDS+=($!)
 wait_port 9002
 
-echo -e "${YELLOW}Starting drps-C on :8003/:9003 (peer→B)${NC}"
+echo -e "${YELLOW}  drps-C :8003/:9003 (peer→B)${NC}"
 python3 drps.py --node-id C --http-port 8003 --control-port 9003 \
 	--peers localhost:9002 -v >"$LOG_DIR/drps-C.log" 2>&1 &
 PIDS+=($!)
 wait_port 9003
 
-# Let mesh stabilize
 sleep 1
 
-# -------------------------------------------------------
-# 3. drpc client (registers on A)
-# -------------------------------------------------------
-echo -e "${YELLOW}Starting drpc (myapp → A, local :${LOCAL_PORT})${NC}"
+echo -e "${YELLOW}  drpc → A (myapp.example.com → :${LOCAL_PORT})${NC}"
 python3 drpc.py --server localhost:9001 --alias myapp \
 	--hostname myapp.example.com --local localhost:$LOCAL_PORT -v \
 	>"$LOG_DIR/drpc.log" 2>&1 &
-PIDS+=($!)
+DRPC_PID=$!
+PIDS+=($DRPC_PID)
 sleep 1
 
 echo
-echo -e "${BOLD}--- Tests ---${NC}"
 
-# -------------------------------------------------------
-# H1: Local hit — user → A, drpc on A
-# -------------------------------------------------------
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-	-H "Host: myapp.example.com" http://localhost:8001 --max-time 5 || echo "000")
+# H1: Local hit
+STATUS=$(http_status -H "Host: myapp.example.com" http://localhost:8001 --max-time 5)
 if [ "$STATUS" = "200" ]; then
-	pass "H1: local hit (A) → $STATUS"
+	pass "H1  local hit (User→A→drpc→local) → $STATUS"
 else
-	fail "H1: local hit (A) → expected 200, got $STATUS"
+	fail "H1  local hit → expected 200, got $STATUS"
 fi
 
-# -------------------------------------------------------
-# H2: Remote 1-hop — user → B, relay B→A
-# -------------------------------------------------------
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-	-H "Host: myapp.example.com" http://localhost:8002 --max-time 10 || echo "000")
+# H2: Remote 1-hop relay
+STATUS=$(http_status -H "Host: myapp.example.com" http://localhost:8002 --max-time 10)
 if [ "$STATUS" = "200" ]; then
-	pass "H2: remote 1-hop (B→A) → $STATUS"
+	pass "H2  1-hop relay (User→B→A→drpc→local) → $STATUS"
 else
-	fail "H2: remote 1-hop (B→A) → expected 200, got $STATUS"
+	fail "H2  1-hop relay → expected 200, got $STATUS"
 fi
 
-# -------------------------------------------------------
-# H3: Partial mesh 2-hop — user → C, relay C→B→A
-# -------------------------------------------------------
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-	-H "Host: myapp.example.com" http://localhost:8003 --max-time 10 || echo "000")
+# H3: Partial mesh 2-hop relay
+STATUS=$(http_status -H "Host: myapp.example.com" http://localhost:8003 --max-time 10)
 if [ "$STATUS" = "200" ]; then
-	pass "H3: partial mesh 2-hop (C→B→A) → $STATUS"
+	pass "H3  2-hop relay (User→C→B→A→drpc→local) → $STATUS"
 else
-	fail "H3: partial mesh 2-hop (C→B→A) → expected 200, got $STATUS"
+	fail "H3  2-hop relay → expected 200, got $STATUS"
 fi
 
-# -------------------------------------------------------
-# F5: Unknown host → broadcast timeout → 502
-# -------------------------------------------------------
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-	-H "Host: unknown.example.com" http://localhost:8002 --max-time 10 || echo "000")
+# F1: Unknown host → broadcast timeout → 502
+STATUS=$(http_status -H "Host: unknown.example.com" http://localhost:8002 --max-time 10)
 if [ "$STATUS" = "502" ]; then
-	pass "F5: unknown host → $STATUS"
+	pass "F1  unknown host → broadcast timeout → $STATUS"
 else
-	fail "F5: unknown host → expected 502, got $STATUS"
+	fail "F1  unknown host → expected 502, got $STATUS"
 fi
 
-# -------------------------------------------------------
+# F2a: Kill drpc → local_map cleanup → 502
+echo -e "\n  ${YELLOW}killing drpc...${NC}"
+kill "$DRPC_PID" 2>/dev/null || true
+wait "$DRPC_PID" 2>/dev/null || true
+sleep 1
+
+STATUS=$(http_status -H "Host: myapp.example.com" http://localhost:8001 --max-time 10)
+if [ "$STATUS" = "502" ]; then
+	pass "F2a drpc killed → local_map cleaned → $STATUS"
+else
+	fail "F2a drpc killed → expected 502, got $STATUS"
+fi
+
+# F2b: Restart drpc → re-register → 200
+echo -e "  ${YELLOW}restarting drpc...${NC}"
+python3 drpc.py --server localhost:9001 --alias myapp \
+	--hostname myapp.example.com --local localhost:$LOCAL_PORT -v \
+	>>"$LOG_DIR/drpc.log" 2>&1 &
+DRPC_PID=$!
+PIDS+=($DRPC_PID)
+sleep 1
+
+STATUS=$(http_status -H "Host: myapp.example.com" http://localhost:8001 --max-time 5)
+if [ "$STATUS" = "200" ]; then
+	pass "F2b drpc restarted → re-registered → $STATUS"
+else
+	fail "F2b drpc restarted → expected 200, got $STATUS"
+fi
+
+# =========================================================
+# Phase 2: Triangle Mesh — F5 (broadcast loop prevention)
+# Topology:  A — B
+#            |   |      (C connects to both A and B)
+#            +- C -+
+# =========================================================
+echo
+echo -e "${BOLD}--- Phase 2: Triangle Mesh (loop test) ---${NC}"
+echo
+
+kill_all
+sleep 1
+
+# Backend
+echo -e "${YELLOW}  backend :${LOCAL_PORT}${NC}"
+python3 -m http.server "$LOCAL_PORT" --directory "$BACKEND_DIR" \
+	>"$LOG_DIR/local-tri.log" 2>&1 &
+PIDS+=($!)
+wait_port "$LOCAL_PORT"
+
+# Triangle: B→A, C→A, C→B  (cycle: A—B—C—A)
+echo -e "${YELLOW}  drps-A :8001/:9001${NC}"
+python3 drps.py --node-id A --http-port 8001 --control-port 9001 -v \
+	>"$LOG_DIR/drps-A-tri.log" 2>&1 &
+PIDS+=($!)
+wait_port 9001
+
+echo -e "${YELLOW}  drps-B :8002/:9002 (peer→A)${NC}"
+python3 drps.py --node-id B --http-port 8002 --control-port 9002 \
+	--peers localhost:9001 -v >"$LOG_DIR/drps-B-tri.log" 2>&1 &
+PIDS+=($!)
+wait_port 9002
+
+echo -e "${YELLOW}  drps-C :8003/:9003 (peer→A,B) ← forms triangle${NC}"
+python3 drps.py --node-id C --http-port 8003 --control-port 9003 \
+	--peers localhost:9001,localhost:9002 -v >"$LOG_DIR/drps-C-tri.log" 2>&1 &
+PIDS+=($!)
+wait_port 9003
+
+sleep 1
+echo
+
+# F5: Broadcast in triangle mesh
+# Without seen_messages: WhoHas loops A→B→C→A→... forever
+# With seen_messages: terminates quickly, returns 502 in ~3s
+START_T=$(date +%s)
+STATUS=$(http_status -H "Host: nope.example.com" http://localhost:8002 --max-time 10)
+END_T=$(date +%s)
+ELAPSED=$((END_T - START_T))
+
+if [ "$STATUS" = "502" ] && [ "$ELAPSED" -lt 8 ]; then
+	pass "F5  triangle broadcast loop → $STATUS in ${ELAPSED}s (seen_messages works)"
+else
+	fail "F5  triangle broadcast loop → expected 502 in <8s, got $STATUS in ${ELAPSED}s"
+fi
+
+# =========================================================
 # Summary
-# -------------------------------------------------------
+# =========================================================
 echo
 echo -e "${BOLD}=== Results: ${GREEN}$PASS passed${NC}, ${RED}$FAIL failed${NC} ==="
+echo
+echo -e "  H1  local hit              H2  1-hop relay"
+echo -e "  H3  2-hop relay            F1  unknown host → 502"
+echo -e "  F2a drpc kill → cleanup    F2b drpc restart → recovery"
+echo -e "  F5  broadcast loop prevention (triangle mesh)"
 
 if [ "$FAIL" -gt 0 ]; then
-	echo -e "\n${YELLOW}Logs in: $LOG_DIR/${NC}"
-	echo "  drps-A: $LOG_DIR/drps-A.log"
-	echo "  drps-B: $LOG_DIR/drps-B.log"
-	echo "  drps-C: $LOG_DIR/drps-C.log"
-	echo "  drpc:   $LOG_DIR/drpc.log"
+	echo -e "\n${YELLOW}Logs: $LOG_DIR/${NC}"
 fi
 
 exit "$FAIL"
