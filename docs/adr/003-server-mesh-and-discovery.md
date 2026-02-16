@@ -16,6 +16,78 @@ User → LB → Server-B (클라이언트 없음)
 클라이언트(drpc)는 NAT 뒤에서 LB를 통해 서버 1대에만 연결한다.
 사용자 요청이 **다른 서버**에 도착하면 어떻게 처리하나?
 
+### 왜 mesh가 필요한가?
+
+#### frp: 서버 1대 — 문제 없음
+
+```mermaid
+graph LR
+    User["User"] -->|"HTTP 요청"| frps["frps<br/>(서버 1대)"]
+    frpc["frpc"] -->|"TCP 연결"| frps
+    frpc --> local["localhost"]
+
+    style frps fill:#66cc66,stroke:#339933
+```
+
+서버가 1대. User도, frpc도 **같은 서버**로 간다. 라우팅 문제가 없다.
+
+#### drp: 서버 N대 — 문제 발생
+
+```mermaid
+graph TD
+    User["User"] -->|"① HTTP 요청"| LB["L4 LB<br/>(round-robin)"]
+    LB -->|"② 랜덤 배분"| B["drps-B"]
+    drpc["drpc<br/>(NAT 뒤)"] -->|"③ TCP 연결<br/>(LB 경유)"| A["drps-A"]
+    drpc --> local["localhost"]
+    B --> FAIL["❌ drpc가 여기 없음!<br/>요청 처리 불가"]
+
+    style B fill:#ffcccc,stroke:#cc0000
+    style FAIL fill:#ff6666,stroke:#cc0000,color:#fff
+    style A fill:#ccffcc,stroke:#339933
+```
+
+서버가 N대. LB가 User를 **아무 서버나**로 보낸다.
+drpc는 drps-A에 연결되어 있는데, User가 drps-B로 왔다.
+**drps-B는 drpc를 모른다. 요청 처리 불가.**
+
+#### drp + mesh — 해결
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant LB as LB
+    participant B as drps-B
+    participant A as drps-A
+    participant D as drpc
+    participant L as localhost
+
+    Note over D,A: drpc는 drps-A에 이미 연결됨
+
+    U->>LB: HTTP (Host: myapp)
+    LB->>B: 랜덤 배분
+    B->>B: localMap → 없음
+
+    rect rgb(200, 220, 255)
+        Note over B,A: mesh로 찾기 (Broadcast)
+        B->>A: WhoHas{myapp}
+        A->>A: localMap → 있음!
+        A->>B: IHave{myapp}
+    end
+
+    rect rgb(200, 255, 220)
+        Note over B,L: mesh로 릴레이 (Relay)
+        B->>A: RelayOpen{myapp}
+        A->>D: ReqWorkConn
+        D->>A: NewWorkConn
+        D->>L: TCP connect
+        Note over U,L: User ↔ B ↔ A ↔ drpc ↔ localhost
+    end
+
+    B-->>U: HTTP 200 OK
+```
+
+**핵심**: mesh = 서버 간 통신 채널. User가 어떤 서버에 도착하든, mesh를 통해 drpc가 있는 서버를 **찾아서**(broadcast) **중계**(relay)한다.
+
 ### 검토한 접근
 
 | 접근 | 문제 |
