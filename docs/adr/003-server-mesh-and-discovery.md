@@ -121,19 +121,81 @@ drp의 분산 로직은 두 단계로 환원된다:
 
 서버들이 TCP로 서로 연결:
 
-```
-Full mesh (최적, 1 hop):     Partial mesh (허용, multi-hop):
+```mermaid
+graph LR
+    subgraph FM["Full Mesh (2~5대)"]
+        A1["A"] --- B1["B"]
+        A1 --- C1["C"]
+        A1 --- D1["D"]
+        B1 --- C1
+        B1 --- D1
+        C1 --- D1
+        linkStyle 0,1,2,3,4,5 stroke:#4a9eff,stroke-width:2px
+    end
 
-  A ──── B                     A ──── B ──── C
-  │ \  / │
-  │  \/  │                     A→C 요청: A → B → C (2 hop)
-  │  /\  │
-  │ /  \ │
-  C ──── D
+    subgraph PM["Partial Mesh (10대+)"]
+        A2["A"] --- B2["B"]
+        B2 --- C2["C"]
+        C2 --- D2["D"]
+        D2 --- E2["E"]
+        A2 --- C2
+        linkStyle 6,7,8,9,10 stroke:#66cc66,stroke-width:2px
+    end
 ```
 
 - Full mesh = 1 hop. N*(N-1)/2 연결 (5대 = 10개)
 - **Partial mesh도 동작** — TTL + 루프 방지. 설정 실수에 견고
+
+### 확장 전략: Full Mesh → Partial Mesh
+
+이 설계의 핵심은 **확장 시 full mesh가 필요 없다**는 점이다.
+
+broadcast + TTL + seen + 역경로 메커니즘이 **토폴로지에 무관하게** 동작하므로, 서버를 늘릴 때 모든 서버를 서로 연결할 필요 없이 일부만 연결하면 된다.
+
+```mermaid
+graph TD
+    subgraph S["Small (2~5대): Full Mesh"]
+        SA["A"] --- SB["B"]
+        SA --- SC["C"]
+        SB --- SC
+    end
+
+    subgraph M["Medium (5~10대): Partial Mesh"]
+        MA["A"] --- MB["B"]
+        MB --- MC["C"]
+        MC --- MD["D"]
+        MD --- ME["E"]
+        MA --- MC
+        MC --- ME
+    end
+
+    subgraph L["Large (10대+): Spine 토폴로지"]
+        LS1["Spine-1"] --- LL1["Leaf-1"]
+        LS1 --- LL2["Leaf-2"]
+        LS1 --- LL3["Leaf-3"]
+        LS2["Spine-2"] --- LL1
+        LS2 --- LL2
+        LS2 --- LL3
+    end
+
+    style S fill:#e6f3ff,stroke:#4a9eff
+    style M fill:#e6ffe6,stroke:#339933
+    style L fill:#fff3e6,stroke:#cc9933
+```
+
+| 규모 | 토폴로지 | 연결 수 | 최대 홉 | 추가 지연 |
+|------|---------|---------|---------|----------|
+| 2~5대 | Full mesh | N*(N-1)/2 = 최대 10개 | 1 | 0 |
+| 5~10대 | Partial mesh | 노드당 2~3개 | 2~3 | sub-ms × 홉 |
+| 10대+ | Spine-leaf | Spine 2개 + Leaf N개 | 2 | sub-ms × 2 |
+
+**왜 이게 가능한가?**
+
+1. **broadcast가 토폴로지를 몰라도 된다** — 모든 이웃에게 전파하면 결국 도달
+2. **TTL이 무한 전파를 막는다** — 홉 수 제한으로 네트워크 보호
+3. **seen이 루프를 막는다** — 같은 메시지 재처리 방지
+4. **역경로가 응답을 보장한다** — 찾기 경로를 그대로 되돌아감
+5. **relay가 intra-cluster** — 홉이 늘어도 sub-ms × 홉 수 = 무시 가능
 
 ### Peer Discovery
 
