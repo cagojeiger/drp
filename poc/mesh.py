@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 
 from protocol import (
@@ -41,8 +42,16 @@ class MeshManager:
         self.peers: dict[str, tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
         self.peer_addresses: dict[str, tuple[str, int]] = peer_addresses
         self.control_port = control_port
-        self.seen_messages: set[str] = set()
+        self.seen_messages: dict[str, float] = {}  # msg_id → monotonic timestamp
         self.pending_searches: dict[str, asyncio.Future[dict[str, object]]] = {}
+        self._inflight: dict[str, asyncio.Future[dict[str, object] | None]] = {}  # hostname → shared future
+
+    def _mark_seen(self, msg_id: str) -> None:
+        now = time.monotonic()
+        if len(self.seen_messages) > 1000:
+            cutoff = now - 30.0
+            self.seen_messages = {k: v for k, v in self.seen_messages.items() if v > cutoff}
+        self.seen_messages[msg_id] = now
 
     async def connect_to_peers(self, peer_specs: list[str]) -> None:
         for spec in peer_specs:
@@ -142,7 +151,7 @@ class MeshManager:
 
         if msg_id in self.seen_messages:
             return
-        self.seen_messages.add(msg_id)
+        self._mark_seen(msg_id)
 
         if ttl <= 0:
             return
@@ -199,10 +208,29 @@ class MeshManager:
         if not self.peers:
             return None
 
+        if hostname in self._inflight:
+            return await self._inflight[hostname]
+
+        loop = asyncio.get_event_loop()
+        shared: asyncio.Future[dict[str, object] | None] = loop.create_future()
+        self._inflight[hostname] = shared
+        try:
+            result = await self._broadcast(hostname)
+            if not shared.done():
+                shared.set_result(result)
+            return result
+        except Exception:
+            if not shared.done():
+                shared.set_result(None)
+            return None
+        finally:
+            self._inflight.pop(hostname, None)
+
+    async def _broadcast(self, hostname: str) -> dict[str, object] | None:
         msg_id = generate_id()
         future = asyncio.get_event_loop().create_future()
         self.pending_searches[msg_id] = future
-        self.seen_messages.add(msg_id)
+        self._mark_seen(msg_id)
 
         body = who_has(msg_id, hostname, 5, [self.node_id])
         for _, peer_writer in self.peers.values():

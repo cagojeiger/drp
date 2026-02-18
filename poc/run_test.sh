@@ -183,6 +183,28 @@ else
 	fail "F2b drpc restarted → expected 200, got $STATUS"
 fi
 
+# H5: Concurrent requests via singleflight
+STATUS_DIR=$(mktemp -d)
+for i in 1 2 3; do
+	(curl -s -o /dev/null -w "%{http_code}" -H "Host: myapp.example.com" \
+		http://localhost:8002 --max-time 10 >"$STATUS_DIR/$i") &
+done
+wait
+H5_OK=true
+for i in 1 2 3; do
+	S=$(cat "$STATUS_DIR/$i")
+	if [ "$S" != "200" ]; then
+		H5_OK=false
+		break
+	fi
+done
+rm -rf "$STATUS_DIR"
+if [ "$H5_OK" = "true" ]; then
+	pass "H5  concurrent requests (3x User→B, singleflight) → all 200"
+else
+	fail "H5  concurrent requests → expected all 200"
+fi
+
 # =========================================================
 # Phase 2: Triangle Mesh — F5 (broadcast loop prevention)
 # Topology:  A — B
