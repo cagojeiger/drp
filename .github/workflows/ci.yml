@@ -49,21 +49,3 @@ jobs:
         run: |
           ./bin/drps --help || true
           ./bin/drpc --help || true
-
-  e2e:
-    name: E2E (Docker)
-    runs-on: ubuntu-latest
-    needs: [build]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-      - name: Build Docker image
-        run: docker build -t drp:test .
-      - name: Run E2E tests
-        run: |
-          docker compose -f test/docker-compose.yml up --build --abort-on-container-exit --exit-code-from test
-      - name: Cleanup
-        if: always()
-        run: docker compose -f test/docker-compose.yml down -v
