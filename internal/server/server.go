@@ -46,7 +46,7 @@ func New(cfg Config) *Server {
 		localMap: make(map[string]*serviceEntry),
 		ready:    make(chan struct{}),
 	}
-	s.mesh = mesh.New(cfg.NodeID, cfg.ControlPort, s.hasHostname, s.getWorkConn)
+	s.mesh = mesh.New(cfg.NodeID, cfg.ControlPort, s.hasHostname, s.getWorkConn, transport.TCP{})
 	return s
 }
 

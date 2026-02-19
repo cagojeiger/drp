@@ -21,19 +21,21 @@ type Config struct {
 }
 
 type Client struct {
-	cfg   Config
-	ready chan struct{}
+	cfg    Config
+	dialer transport.Dialer
+	ready  chan struct{}
 }
 
-func New(cfg Config) *Client {
+func New(cfg Config, dialer transport.Dialer) *Client {
 	return &Client{
-		cfg:   cfg,
-		ready: make(chan struct{}),
+		cfg:    cfg,
+		dialer: dialer,
+		ready:  make(chan struct{}),
 	}
 }
 
 func (c *Client) Run(ctx context.Context) error {
-	ctrlConn, err := transport.Dial(c.cfg.ServerAddr)
+	ctrlConn, err := c.dialer.Dial(c.cfg.ServerAddr)
 	if err != nil {
 		return fmt.Errorf("connect to server: %w", err)
 	}
@@ -123,7 +125,7 @@ func (c *Client) controlLoop(ctrlConn net.Conn) error {
 }
 
 func (c *Client) handleWorkConn() {
-	workConn, err := transport.Dial(c.cfg.ServerAddr)
+	workConn, err := c.dialer.Dial(c.cfg.ServerAddr)
 	if err != nil {
 		log.Printf("[drpc] failed to open work conn: %v", err)
 		return
@@ -152,7 +154,7 @@ func (c *Client) handleWorkConn() {
 		}
 	}
 
-	localConn, err := transport.Dial(c.cfg.LocalAddr)
+	localConn, err := c.dialer.Dial(c.cfg.LocalAddr)
 	if err != nil {
 		log.Printf("[drpc] failed to connect to local %s: %v", c.cfg.LocalAddr, err)
 		_ = workConn.Close()
