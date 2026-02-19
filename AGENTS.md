@@ -43,6 +43,7 @@ Proposed | Accepted | Superseded by [ADR-XXX](./XXX-xxx.md)
 | 002 | 호스트 기반 라우팅 | 요청을 어떤 서비스로 보내나? |
 | 003 | 서버 메시와 서비스 검색 | 서버들이 어떻게 협력하나? |
 | 004 | 프로토콜과 메시지 | 컴포넌트가 뭘로 대화하나? |
+| 005 | Mesh 전송 계층 — QUIC | mesh를 뭘로 연결하나? |
 
 ## 핵심 설계 결정
 
@@ -52,6 +53,7 @@ Proposed | Accepted | Superseded by [ADR-XXX](./XXX-xxx.md)
 | 라우팅 | Host 헤더 / TLS SNI | 포트 2개로 무제한 서비스 |
 | 분산 상태 | Server Mesh (broadcast + relay) | 외부 의존성 제로 |
 | 메시지 포맷 | TLV + JSON | 디버깅 용이. 기술 비종속 |
+| Mesh 전송 | QUIC (drps↔drps), TCP (drpc↔drps) | 멀티플렉싱, HoL blocking 해소 |
 | HA | 기본 1개 연결, 선택적 HA | mesh가 라우팅. HA는 fault tolerance 옵션 |
 
 ## 코드 컨벤션
