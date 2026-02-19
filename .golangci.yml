@@ -1,0 +1,35 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosimple
+    - gocritic
+    - misspell
+
+linters-settings:
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+    disabled-checks:
+      - commentFormatting
+      - hugeParam
+
+formatters:
+  enable:
+    - gofmt
+
+output:
+  sort-order:
+    - file
+
+issues:
+  exclude-dirs:
+    - poc
+    - .repos
+    - vendor

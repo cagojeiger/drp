@@ -1,3 +1,10 @@
+# Go
+bin/
+*.exe
+*.test
+*.out
+
+# Python POC
 poc/.logs/
 poc/__pycache__/
 __pycache__/

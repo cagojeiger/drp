@@ -1,0 +1,77 @@
+services:
+  backend:
+    image: drp:test
+    command: >
+      sh -c 'mkdir -p /tmp/www && echo "hello from backend" > /tmp/www/index.html &&
+      cd /tmp/www && python3 -m http.server 5000 2>/dev/null ||
+      (echo "hello from backend" > /tmp/response.txt &&
+      while true; do echo -e "HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\nhello from backend\n" | nc -l -p 5000 || break; done)'
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+  drps-a:
+    image: drp:test
+    command: ["drps", "--node-id=A", "--http-port=80", "--control-port=9000", "-v"]
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  drps-b:
+    image: drp:test
+    command: ["drps", "--node-id=B", "--http-port=80", "--control-port=9000", "--peers=drps-a:9000", "-v"]
+    depends_on:
+      - drps-a
+
+  drps-c:
+    image: drp:test
+    command: ["drps", "--node-id=C", "--http-port=80", "--control-port=9000", "--peers=drps-b:9000", "-v"]
+    depends_on:
+      - drps-b
+
+  drpc:
+    image: drp:test
+    command: ["drpc", "--server=drps-a:9000", "--alias=myapp", "--hostname=myapp.example.com", "--local=backend:5000", "-v"]
+    depends_on:
+      - drps-a
+
+  test:
+    image: drp:test
+    depends_on:
+      - drps-a
+      - drps-b
+      - drps-c
+      - drpc
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        echo "Waiting for services to be ready..."
+        sleep 5
+
+        PASS=0
+        FAIL=0
+
+        check() {
+          name=$$1; url=$$2; host=$$3; expect=$$4
+          code=$$(curl -sf -o /dev/null -w '%{http_code}' -H "Host: $$host" "$$url" 2>/dev/null || echo "000")
+          if [ "$$code" = "$$expect" ]; then
+            echo "PASS $$name ($$code)"
+            PASS=$$((PASS + 1))
+          else
+            echo "FAIL $$name (expected $$expect, got $$code)"
+            FAIL=$$((FAIL + 1))
+          fi
+        }
+
+        check "H1_LocalHit"      "http://drps-a:80/" "myapp.example.com" "200"
+        check "H2_OneHopRelay"    "http://drps-b:80/" "myapp.example.com" "200"
+        check "H3_TwoHopRelay"    "http://drps-c:80/" "myapp.example.com" "200"
+        check "F1_UnknownHostA"   "http://drps-a:80/" "unknown.example.com" "502"
+        check "F2a_UnknownHostB"  "http://drps-b:80/" "unknown.example.com" "502"
+        check "F2b_UnknownHostC"  "http://drps-c:80/" "unknown.example.com" "502"
+
+        echo ""
+        echo "Results: $$PASS passed, $$FAIL failed"
+        [ "$$FAIL" -eq 0 ] && exit 0 || exit 1
