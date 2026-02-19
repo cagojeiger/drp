@@ -18,6 +18,7 @@ type GetWorkConnFunc func(hostname string) (net.Conn, error)
 type MeshManager struct {
 	nodeID      string
 	controlPort int
+	dialer      transport.Dialer
 
 	hasHostname func(string) bool
 	getWorkConn GetWorkConnFunc
@@ -30,10 +31,11 @@ type MeshManager struct {
 	mu            sync.RWMutex
 }
 
-func New(nodeID string, controlPort int, hasHostname func(string) bool, getWorkConn GetWorkConnFunc) *MeshManager {
+func New(nodeID string, controlPort int, hasHostname func(string) bool, getWorkConn GetWorkConnFunc, dialer transport.Dialer) *MeshManager {
 	return &MeshManager{
 		nodeID:        nodeID,
 		controlPort:   controlPort,
+		dialer:        dialer,
 		hasHostname:   hasHostname,
 		getWorkConn:   getWorkConn,
 		peers:         make(map[string]net.Conn),
@@ -49,7 +51,7 @@ func (m *MeshManager) ConnectToPeers(specs []string) {
 		if spec == "" {
 			continue
 		}
-		conn, err := transport.Dial(spec)
+		conn, err := m.dialer.Dial(spec)
 		if err != nil {
 			log.Printf("[mesh-%s] failed connecting to peer %s: %v", m.nodeID, spec, err)
 			continue
@@ -348,7 +350,7 @@ func (m *MeshManager) OpenRelay(hostname, targetNodeID string, path []string) (n
 		return nil, fmt.Errorf("unknown next hop: %s", nextHop)
 	}
 
-	conn, err := transport.Dial(addr)
+	conn, err := m.dialer.Dial(addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial next hop %s (%s): %w", nextHop, addr, err)
 	}
@@ -396,7 +398,7 @@ func (m *MeshManager) HandleRelayOpen(conn net.Conn, body *protocol.RelayOpenBod
 		return
 	}
 
-	nextConn, err := transport.Dial(addr)
+	nextConn, err := m.dialer.Dial(addr)
 	if err != nil {
 		log.Printf("[mesh-%s] relay %s: dial %s failed: %v", m.nodeID, body.RelayID, nextHop, err)
 		_ = conn.Close()
