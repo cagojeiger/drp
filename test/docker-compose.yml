@@ -55,7 +55,7 @@ services:
 
         check() {
           name=$$1; url=$$2; host=$$3; expect=$$4
-          code=$$(curl -sf -o /dev/null -w '%{http_code}' -H "Host: $$host" "$$url" 2>/dev/null || echo "000")
+          code=$$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $$host" "$$url" 2>/dev/null || true)
           if [ "$$code" = "$$expect" ]; then
             echo "PASS $$name ($$code)"
             PASS=$$((PASS + 1))
