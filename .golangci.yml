@@ -10,26 +10,29 @@ linters:
     - gosimple
     - gocritic
     - misspell
-
-linters-settings:
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - style
-    disabled-checks:
-      - commentFormatting
-      - hugeParam
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+      disabled-checks:
+        - commentFormatting
+        - hugeParam
+  exclusions:
+    paths:
+      - poc
+      - .repos
+      - vendor
 
 formatters:
   enable:
     - gofmt
+  exclusions:
+    paths:
+      - poc
+      - .repos
+      - vendor
 
 output:
   sort-order:
     - file
-
-issues:
-  exclude-dirs:
-    - poc
-    - .repos
-    - vendor
