@@ -10,6 +10,7 @@ import (
 	"os/signal"
 
 	"github.com/cagojeiger/drp/internal/client"
+	"github.com/cagojeiger/drp/internal/transport"
 )
 
 func main() {
@@ -38,7 +39,7 @@ func main() {
 		Hostname:   *hostname,
 		LocalAddr:  *local,
 		Verbose:    *verbose,
-	})
+	}, transport.TCP{})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 

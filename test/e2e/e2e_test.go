@@ -12,6 +12,7 @@ import (
 
 	"github.com/cagojeiger/drp/internal/client"
 	"github.com/cagojeiger/drp/internal/server"
+	"github.com/cagojeiger/drp/internal/transport"
 )
 
 func TestMeshRelay(t *testing.T) {
@@ -55,7 +56,7 @@ func TestMeshRelay(t *testing.T) {
 		Alias:      "myapp",
 		Hostname:   "myapp.example.com",
 		LocalAddr:  backendAddr,
-	})
+	}, transport.TCP{})
 	go drpc.Run(ctx)
 	waitReady(t, drpc.Ready(), "drpc")
 
