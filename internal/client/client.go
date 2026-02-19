@@ -37,7 +37,7 @@ func (c *Client) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("connect to server: %w", err)
 	}
-	defer ctrlConn.Close()
+	defer func() { _ = ctrlConn.Close() }()
 	log.Printf("[drpc] connected to %s", c.cfg.ServerAddr)
 
 	if err := protocol.WriteMsg(ctrlConn, protocol.MsgLogin, &protocol.LoginBody{Alias: c.cfg.Alias}); err != nil {
@@ -53,7 +53,9 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 	var loginResp protocol.LoginRespBody
 	if len(body) > 0 {
-		json.Unmarshal(body, &loginResp)
+		if err := json.Unmarshal(body, &loginResp); err != nil {
+			return fmt.Errorf("unmarshal login resp: %w", err)
+		}
 	}
 	if !loginResp.OK {
 		return fmt.Errorf("login failed: %s", loginResp.Message)
@@ -76,7 +78,9 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 	var proxyResp protocol.NewProxyRespBody
 	if len(body) > 0 {
-		json.Unmarshal(body, &proxyResp)
+		if err := json.Unmarshal(body, &proxyResp); err != nil {
+			return fmt.Errorf("unmarshal proxy resp: %w", err)
+		}
 	}
 	if !proxyResp.OK {
 		return fmt.Errorf("proxy registration failed: %s", proxyResp.Message)
@@ -126,32 +130,35 @@ func (c *Client) handleWorkConn() {
 	}
 
 	if err := protocol.WriteMsg(workConn, protocol.MsgNewWorkConn, &protocol.NewWorkConnBody{Alias: c.cfg.Alias}); err != nil {
-		workConn.Close()
+		_ = workConn.Close()
 		return
 	}
 
 	msgType, body, err := protocol.ReadMsg(workConn)
 	if err != nil {
-		workConn.Close()
+		_ = workConn.Close()
 		return
 	}
 	if msgType != protocol.MsgStartWorkConn {
-		workConn.Close()
+		_ = workConn.Close()
 		return
 	}
 
 	var swc protocol.StartWorkConnBody
 	if len(body) > 0 {
-		json.Unmarshal(body, &swc)
+		if err := json.Unmarshal(body, &swc); err != nil {
+			_ = workConn.Close()
+			return
+		}
 	}
 
 	localConn, err := transport.Dial(c.cfg.LocalAddr)
 	if err != nil {
 		log.Printf("[drpc] failed to connect to local %s: %v", c.cfg.LocalAddr, err)
-		workConn.Close()
+		_ = workConn.Close()
 		return
 	}
 
-	go protocol.Pipe(workConn, localConn)
-	protocol.Pipe(localConn, workConn)
+	go func() { _ = protocol.Pipe(workConn, localConn) }()
+	_ = protocol.Pipe(localConn, workConn)
 }

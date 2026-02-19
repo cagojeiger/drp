@@ -61,14 +61,14 @@ func (m *MeshManager) ConnectToPeers(specs []string) {
 			ControlPort: m.controlPort,
 		})
 		if err != nil {
-			conn.Close()
+			_ = conn.Close()
 			log.Printf("[mesh-%s] failed sending hello to %s: %v", m.nodeID, spec, err)
 			continue
 		}
 
 		msgType, body, err := protocol.ReadMsg(conn)
 		if err != nil || msgType != protocol.MsgMeshHello {
-			conn.Close()
+			_ = conn.Close()
 			log.Printf("[mesh-%s] invalid hello response from %s", m.nodeID, spec)
 			continue
 		}
@@ -76,13 +76,13 @@ func (m *MeshManager) ConnectToPeers(specs []string) {
 		var hello protocol.MeshHelloBody
 		if len(body) > 0 {
 			if err := json.Unmarshal(body, &hello); err != nil {
-				conn.Close()
+				_ = conn.Close()
 				continue
 			}
 		}
 
 		if hello.NodeID == "" {
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 
@@ -98,7 +98,7 @@ func (m *MeshManager) ConnectToPeers(specs []string) {
 
 func (m *MeshManager) HandlePeer(conn net.Conn, hello *protocol.MeshHelloBody) {
 	if hello == nil || hello.NodeID == "" {
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
@@ -108,7 +108,7 @@ func (m *MeshManager) HandlePeer(conn net.Conn, hello *protocol.MeshHelloBody) {
 		ControlPort: m.controlPort,
 	})
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
@@ -134,7 +134,7 @@ func (m *MeshManager) peerLoop(peerID string, conn net.Conn) {
 		m.mu.Lock()
 		delete(m.peers, peerID)
 		m.mu.Unlock()
-		conn.Close()
+		_ = conn.Close()
 	}()
 
 	for {
@@ -333,7 +333,7 @@ func (m *MeshManager) broadcast(hostname string) (*protocol.IHaveBody, error) {
 	}
 }
 
-func (m *MeshManager) OpenRelay(hostname string, targetNodeID string, path []string) (net.Conn, error) {
+func (m *MeshManager) OpenRelay(hostname, targetNodeID string, path []string) (net.Conn, error) {
 	if len(path) == 0 {
 		return nil, fmt.Errorf("relay path is empty")
 	}
@@ -359,7 +359,7 @@ func (m *MeshManager) OpenRelay(hostname string, targetNodeID string, path []str
 		NextHops: remaining,
 	})
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 
@@ -368,7 +368,7 @@ func (m *MeshManager) OpenRelay(hostname string, targetNodeID string, path []str
 
 func (m *MeshManager) HandleRelayOpen(conn net.Conn, body *protocol.RelayOpenBody) {
 	if body.Hostname == "" || body.RelayID == "" {
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
@@ -376,11 +376,11 @@ func (m *MeshManager) HandleRelayOpen(conn net.Conn, body *protocol.RelayOpenBod
 		workConn, err := m.getWorkConn(body.Hostname)
 		if err != nil {
 			log.Printf("[mesh-%s] relay %s: no work conn for %s: %v", m.nodeID, body.RelayID, body.Hostname, err)
-			conn.Close()
+			_ = conn.Close()
 			return
 		}
-		go protocol.Pipe(conn, workConn)
-		protocol.Pipe(workConn, conn)
+		go func() { _ = protocol.Pipe(conn, workConn) }()
+		_ = protocol.Pipe(workConn, conn)
 		return
 	}
 
@@ -392,14 +392,14 @@ func (m *MeshManager) HandleRelayOpen(conn net.Conn, body *protocol.RelayOpenBod
 	m.mu.RUnlock()
 	if !ok {
 		log.Printf("[mesh-%s] relay %s: unknown next hop %s", m.nodeID, body.RelayID, nextHop)
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
 	nextConn, err := transport.Dial(addr)
 	if err != nil {
 		log.Printf("[mesh-%s] relay %s: dial %s failed: %v", m.nodeID, body.RelayID, nextHop, err)
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
@@ -409,13 +409,13 @@ func (m *MeshManager) HandleRelayOpen(conn net.Conn, body *protocol.RelayOpenBod
 		NextHops: remaining,
 	})
 	if err != nil {
-		conn.Close()
-		nextConn.Close()
+		_ = conn.Close()
+		_ = nextConn.Close()
 		return
 	}
 
-	go protocol.Pipe(conn, nextConn)
-	protocol.Pipe(nextConn, conn)
+	go func() { _ = protocol.Pipe(conn, nextConn) }()
+	_ = protocol.Pipe(nextConn, conn)
 }
 
 func (m *MeshManager) HasPeers() bool {

@@ -55,13 +55,13 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("http listen: %w", err)
 	}
-	defer httpLn.Close()
+	defer func() { _ = httpLn.Close() }()
 
 	ctrlLn, err := transport.Listen(fmt.Sprintf(":%d", s.cfg.ControlPort))
 	if err != nil {
 		return fmt.Errorf("control listen: %w", err)
 	}
-	defer ctrlLn.Close()
+	defer func() { _ = ctrlLn.Close() }()
 
 	s.httpAddr = httpLn.Addr().String()
 	s.ctrlAddr = ctrlLn.Addr().String()
@@ -104,27 +104,27 @@ func (s *Server) acceptLoop(ln net.Listener, handler func(net.Conn)) {
 }
 
 func (s *Server) handleHTTP(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	buf := make([]byte, 0, 4096)
 	tmp := make([]byte, 4096)
 	for !bytes.Contains(buf, []byte("\r\n\r\n")) {
-		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		n, err := conn.Read(tmp)
 		if err != nil {
 			return
 		}
 		buf = append(buf, tmp[:n]...)
 		if len(buf) > 65536 {
-			conn.Write([]byte("HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n"))
+			_, _ = conn.Write([]byte("HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n"))
 			return
 		}
 	}
-	conn.SetReadDeadline(time.Time{})
+	_ = conn.SetReadDeadline(time.Time{})
 
 	hostname := protocol.ExtractHost(buf)
 	if hostname == "" {
-		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"))
+		_, _ = conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"))
 		return
 	}
 
@@ -142,7 +142,7 @@ func (s *Server) handleHTTP(conn net.Conn) {
 
 func (s *Server) handleLocalHit(conn net.Conn, buf []byte, hostname string, entry *serviceEntry) {
 	if err := protocol.WriteMsg(entry.ctrlConn, protocol.MsgReqWorkConn, &protocol.ReqWorkConnBody{}); err != nil {
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 
@@ -150,29 +150,29 @@ func (s *Server) handleLocalHit(conn net.Conn, buf []byte, hostname string, entr
 	select {
 	case workConn = <-entry.workQueue:
 	case <-time.After(10 * time.Second):
-		conn.Write([]byte("HTTP/1.1 504 Gateway Timeout\r\n\r\n"))
+		_, _ = conn.Write([]byte("HTTP/1.1 504 Gateway Timeout\r\n\r\n"))
 		return
 	}
 
 	if err := protocol.WriteMsg(workConn, protocol.MsgStartWorkConn, &protocol.StartWorkConnBody{Hostname: hostname}); err != nil {
-		workConn.Close()
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		_ = workConn.Close()
+		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 
 	if _, err := workConn.Write(buf); err != nil {
-		workConn.Close()
+		_ = workConn.Close()
 		return
 	}
 
-	go protocol.Pipe(conn, workConn)
-	protocol.Pipe(workConn, conn)
+	go func() { _ = protocol.Pipe(conn, workConn) }()
+	_ = protocol.Pipe(workConn, conn)
 }
 
 func (s *Server) handleMeshRelay(conn net.Conn, buf []byte, hostname string) {
 	result, err := s.mesh.FindService(hostname)
 	if err != nil || result == nil {
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"))
+		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"))
 		return
 	}
 
@@ -187,23 +187,23 @@ func (s *Server) handleMeshRelay(conn net.Conn, buf []byte, hostname string) {
 
 	relayConn, err := s.mesh.OpenRelay(hostname, targetNode, relayPath)
 	if err != nil {
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 
 	if _, err := relayConn.Write(buf); err != nil {
-		relayConn.Close()
+		_ = relayConn.Close()
 		return
 	}
 
-	go protocol.Pipe(conn, relayConn)
-	protocol.Pipe(relayConn, conn)
+	go func() { _ = protocol.Pipe(conn, relayConn) }()
+	_ = protocol.Pipe(relayConn, conn)
 }
 
 func (s *Server) handleControl(conn net.Conn) {
 	msgType, body, err := protocol.ReadMsg(conn)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
@@ -211,33 +211,33 @@ func (s *Server) handleControl(conn net.Conn) {
 	case protocol.MsgLogin:
 		var lb protocol.LoginBody
 		if len(body) > 0 {
-			json.Unmarshal(body, &lb)
+			_ = json.Unmarshal(body, &lb)
 		}
 		s.clientSession(conn, &lb)
 
 	case protocol.MsgMeshHello:
 		var hb protocol.MeshHelloBody
 		if len(body) > 0 {
-			json.Unmarshal(body, &hb)
+			_ = json.Unmarshal(body, &hb)
 		}
 		s.mesh.HandlePeer(conn, &hb)
 
 	case protocol.MsgNewWorkConn:
 		var wb protocol.NewWorkConnBody
 		if len(body) > 0 {
-			json.Unmarshal(body, &wb)
+			_ = json.Unmarshal(body, &wb)
 		}
 		s.acceptWorkConn(conn, &wb)
 
 	case protocol.MsgRelayOpen:
 		var rb protocol.RelayOpenBody
 		if len(body) > 0 {
-			json.Unmarshal(body, &rb)
+			_ = json.Unmarshal(body, &rb)
 		}
 		s.mesh.HandleRelayOpen(conn, &rb)
 
 	default:
-		conn.Close()
+		_ = conn.Close()
 	}
 }
 
@@ -248,25 +248,25 @@ func (s *Server) clientSession(conn net.Conn, login *protocol.LoginBody) {
 	}
 
 	if err := protocol.WriteMsg(conn, protocol.MsgLoginResp, &protocol.LoginRespBody{OK: true, Message: "ok"}); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 	log.Printf("[drps-%s] client %s logged in", s.cfg.NodeID, alias)
 
 	msgType, body, err := protocol.ReadMsg(conn)
 	if err != nil || msgType != protocol.MsgNewProxy {
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
 	var np protocol.NewProxyBody
 	if len(body) > 0 {
-		json.Unmarshal(body, &np)
+		_ = json.Unmarshal(body, &np)
 	}
 
 	if np.Hostname == "" {
-		protocol.WriteMsg(conn, protocol.MsgNewProxyResp, &protocol.NewProxyRespBody{OK: false, Message: "missing hostname"})
-		conn.Close()
+		_ = protocol.WriteMsg(conn, protocol.MsgNewProxyResp, &protocol.NewProxyRespBody{OK: false, Message: "missing hostname"})
+		_ = conn.Close()
 		return
 	}
 
@@ -284,7 +284,7 @@ func (s *Server) clientSession(conn net.Conn, login *protocol.LoginBody) {
 		s.mapMu.Lock()
 		delete(s.localMap, np.Hostname)
 		s.mapMu.Unlock()
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 	log.Printf("[drps-%s] registered %s -> %s", s.cfg.NodeID, alias, np.Hostname)
@@ -293,7 +293,7 @@ func (s *Server) clientSession(conn net.Conn, login *protocol.LoginBody) {
 		s.mapMu.Lock()
 		delete(s.localMap, np.Hostname)
 		s.mapMu.Unlock()
-		conn.Close()
+		_ = conn.Close()
 		log.Printf("[drps-%s] client %s (%s) disconnected", s.cfg.NodeID, alias, np.Hostname)
 	}()
 
@@ -315,13 +315,13 @@ func (s *Server) acceptWorkConn(conn net.Conn, body *protocol.NewWorkConnBody) {
 			select {
 			case entry.workQueue <- conn:
 			default:
-				conn.Close()
+				_ = conn.Close()
 			}
 			return
 		}
 	}
 	s.mapMu.RUnlock()
-	conn.Close()
+	_ = conn.Close()
 }
 
 func (s *Server) hasHostname(hostname string) bool {
@@ -346,7 +346,7 @@ func (s *Server) getWorkConn(hostname string) (net.Conn, error) {
 	select {
 	case workConn := <-entry.workQueue:
 		if err := protocol.WriteMsg(workConn, protocol.MsgStartWorkConn, &protocol.StartWorkConnBody{Hostname: hostname}); err != nil {
-			workConn.Close()
+			_ = workConn.Close()
 			return nil, err
 		}
 		return workConn, nil

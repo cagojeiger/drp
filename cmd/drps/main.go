@@ -41,9 +41,10 @@ func main() {
 	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
 
 	if err := srv.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		cancel()
 		log.Fatal(err)
 	}
+	cancel()
 }

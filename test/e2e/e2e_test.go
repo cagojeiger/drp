@@ -84,7 +84,7 @@ func TestMeshRelay(t *testing.T) {
 				},
 			}
 			url := fmt.Sprintf("http://%s/", tt.httpAddr)
-			req, err := http.NewRequest("GET", url, nil)
+			req, err := http.NewRequest("GET", url, http.NoBody)
 			if err != nil {
 				t.Fatalf("create request: %v", err)
 			}
