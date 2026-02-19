@@ -121,6 +121,7 @@ See [docs/adr/](docs/adr/) for Architecture Decision Records:
 | [002](docs/adr/002-host-sni-routing.md) | Host header + TLS SNI routing |
 | [003](docs/adr/003-server-mesh-and-discovery.md) | Server mesh, broadcast discovery, relay |
 | [004](docs/adr/004-protocol-and-messages.md) | TLV + JSON protocol |
+| [005](docs/adr/005-mesh-transport-quic.md) | QUIC for mesh transport (multiplexing) |
 
 ## License
 
