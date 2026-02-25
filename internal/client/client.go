@@ -1,23 +1,26 @@
 package client
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
+	"time"
 
 	"github.com/cagojeiger/drp/internal/protocol"
 	"github.com/cagojeiger/drp/internal/transport"
+	drppb "github.com/cagojeiger/drp/proto/drp"
 )
 
 type Config struct {
-	ServerAddr string
-	Alias      string
-	Hostname   string
-	LocalAddr  string
-	Verbose    bool
+	ServerAddr string // drps control address (host:port)
+	Alias      string // service alias (e.g. "myapp")
+	Hostname   string // public hostname (e.g. "myapp.example.com")
+	ProxyType  string // "http" or "https", default "http"
+	LocalAddr  string // local service address (host:port)
+	APIKey     string // API key for authentication
+	Version    string // client version string
 }
 
 type Client struct {
@@ -27,140 +30,155 @@ type Client struct {
 }
 
 func New(cfg Config, dialer transport.Dialer) *Client {
-	return &Client{
-		cfg:    cfg,
-		dialer: dialer,
-		ready:  make(chan struct{}),
+	if cfg.ProxyType == "" {
+		cfg.ProxyType = "http"
 	}
+	if cfg.Version == "" {
+		cfg.Version = "0.1.0"
+	}
+	return &Client{cfg: cfg, dialer: dialer, ready: make(chan struct{})}
 }
 
 func (c *Client) Run(ctx context.Context) error {
-	ctrlConn, err := c.dialer.Dial(c.cfg.ServerAddr)
+	conn, err := c.dialer.Dial(c.cfg.ServerAddr)
 	if err != nil {
-		return fmt.Errorf("connect to server: %w", err)
+		return fmt.Errorf("dial server: %w", err)
 	}
-	defer func() { _ = ctrlConn.Close() }()
-	log.Printf("[drpc] connected to %s", c.cfg.ServerAddr)
-
-	if err := protocol.WriteMsg(ctrlConn, protocol.MsgLogin, &protocol.LoginBody{Alias: c.cfg.Alias}); err != nil {
+	defer conn.Close()
+	if err := protocol.WriteEnvelope(conn, &drppb.Envelope{
+		Payload: &drppb.Envelope_Login{Login: &drppb.Login{
+			ApiKey:  c.cfg.APIKey,
+			Version: c.cfg.Version,
+		}},
+	}); err != nil {
 		return fmt.Errorf("send login: %w", err)
 	}
 
-	msgType, body, err := protocol.ReadMsg(ctrlConn)
+	r := bufio.NewReader(conn)
+	env, err := protocol.ReadEnvelope(r)
 	if err != nil {
-		return fmt.Errorf("read login resp: %w", err)
+		return fmt.Errorf("read login response: %w", err)
 	}
-	if msgType != protocol.MsgLoginResp {
-		return fmt.Errorf("expected LoginResp, got 0x%02x", msgType)
-	}
-	var loginResp protocol.LoginRespBody
-	if len(body) > 0 {
-		if err := json.Unmarshal(body, &loginResp); err != nil {
-			return fmt.Errorf("unmarshal login resp: %w", err)
+	loginResp := env.GetLoginResp()
+	if loginResp == nil || !loginResp.Ok {
+		errMsg := "invalid login response"
+		if loginResp != nil && loginResp.Error != "" {
+			errMsg = loginResp.Error
 		}
+		return fmt.Errorf("login failed: %s", errMsg)
 	}
-	if !loginResp.OK {
-		return fmt.Errorf("login failed: %s", loginResp.Message)
-	}
-	log.Printf("[drpc] login OK")
-
-	if err := protocol.WriteMsg(ctrlConn, protocol.MsgNewProxy, &protocol.NewProxyBody{
-		Alias:    c.cfg.Alias,
-		Hostname: c.cfg.Hostname,
+	if err := protocol.WriteEnvelope(conn, &drppb.Envelope{
+		Payload: &drppb.Envelope_NewProxy{NewProxy: &drppb.NewProxy{
+			Alias:    c.cfg.Alias,
+			Hostname: c.cfg.Hostname,
+			Type:     c.cfg.ProxyType,
+		}},
 	}); err != nil {
 		return fmt.Errorf("send new proxy: %w", err)
 	}
 
-	msgType, body, err = protocol.ReadMsg(ctrlConn)
+	env, err = protocol.ReadEnvelope(r)
 	if err != nil {
-		return fmt.Errorf("read proxy resp: %w", err)
+		return fmt.Errorf("read new proxy response: %w", err)
 	}
-	if msgType != protocol.MsgNewProxyResp {
-		return fmt.Errorf("expected NewProxyResp, got 0x%02x", msgType)
-	}
-	var proxyResp protocol.NewProxyRespBody
-	if len(body) > 0 {
-		if err := json.Unmarshal(body, &proxyResp); err != nil {
-			return fmt.Errorf("unmarshal proxy resp: %w", err)
+	proxyResp := env.GetNewProxyResp()
+	if proxyResp == nil || !proxyResp.Ok {
+		errMsg := "invalid new proxy response"
+		if proxyResp != nil && proxyResp.Error != "" {
+			errMsg = proxyResp.Error
 		}
+		return fmt.Errorf("new proxy failed: %s", errMsg)
 	}
-	if !proxyResp.OK {
-		return fmt.Errorf("proxy registration failed: %s", proxyResp.Message)
-	}
-	log.Printf("[drpc] registered %s -> %s", c.cfg.Alias, c.cfg.Hostname)
-
 	close(c.ready)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- c.controlLoop(ctrlConn)
-	}()
-
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return c.controlLoop(ctx, conn, r)
 }
 
 func (c *Client) Ready() <-chan struct{} {
 	return c.ready
 }
 
-func (c *Client) controlLoop(ctrlConn net.Conn) error {
-	for {
-		msgType, _, err := protocol.ReadMsg(ctrlConn)
-		if err != nil {
-			if err == io.EOF {
-				return fmt.Errorf("control connection closed")
-			}
-			return err
-		}
+func (c *Client) controlLoop(ctx context.Context, conn net.Conn, r *bufio.Reader) error {
+	go func() {
+		<-ctx.Done()
+		_ = conn.Close()
+	}()
 
-		if msgType == protocol.MsgReqWorkConn {
-			go c.handleWorkConn()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := protocol.WriteEnvelope(conn, &drppb.Envelope{
+					Payload: &drppb.Envelope_Ping{Ping: &drppb.Ping{}},
+				}); err != nil {
+					log.Printf("heartbeat write failed: %v", err)
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+	}()
+
+	for {
+		env, err := protocol.ReadEnvelope(r)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("read: %w", err)
+		}
+		switch payload := env.Payload.(type) {
+		case *drppb.Envelope_ReqWorkConn:
+			go c.handleWorkConn(payload.ReqWorkConn.GetProxyAlias())
+		case *drppb.Envelope_Pong:
+		default:
+			log.Printf("unexpected control message type: %T", payload)
 		}
 	}
 }
 
-func (c *Client) handleWorkConn() {
+func (c *Client) handleWorkConn(proxyAlias string) {
 	workConn, err := c.dialer.Dial(c.cfg.ServerAddr)
 	if err != nil {
-		log.Printf("[drpc] failed to open work conn: %v", err)
+		log.Printf("work conn dial failed: %v", err)
+		return
+	}
+	defer workConn.Close()
+	if err := protocol.WriteEnvelope(workConn, &drppb.Envelope{
+		Payload: &drppb.Envelope_NewWorkConn{NewWorkConn: &drppb.NewWorkConn{
+			ProxyAlias: proxyAlias,
+		}},
+	}); err != nil {
+		log.Printf("send new_work_conn failed: %v", err)
 		return
 	}
 
-	if err := protocol.WriteMsg(workConn, protocol.MsgNewWorkConn, &protocol.NewWorkConnBody{Alias: c.cfg.Alias}); err != nil {
-		_ = workConn.Close()
-		return
-	}
-
-	msgType, body, err := protocol.ReadMsg(workConn)
+	r := bufio.NewReader(workConn)
+	env, err := protocol.ReadEnvelope(r)
 	if err != nil {
-		_ = workConn.Close()
+		log.Printf("read start_work_conn failed: %v", err)
 		return
 	}
-	if msgType != protocol.MsgStartWorkConn {
-		_ = workConn.Close()
+	if env.GetStartWorkConn() == nil {
+		log.Printf("unexpected work conn response: %T", env.Payload)
 		return
 	}
+	localConn, err := net.Dial("tcp", c.cfg.LocalAddr)
+	if err != nil {
+		log.Printf("dial local service failed: %v", err)
+		return
+	}
+	defer localConn.Close()
 
-	var swc protocol.StartWorkConnBody
-	if len(body) > 0 {
-		if err := json.Unmarshal(body, &swc); err != nil {
-			_ = workConn.Close()
-			return
+	go func() {
+		if err := protocol.Pipe(workConn, localConn); err != nil {
+			log.Printf("pipe local->work failed: %v", err)
 		}
+	}()
+	if err := protocol.Pipe(localConn, r); err != nil {
+		log.Printf("pipe work->local failed: %v", err)
 	}
-
-	localConn, err := c.dialer.Dial(c.cfg.LocalAddr)
-	if err != nil {
-		log.Printf("[drpc] failed to connect to local %s: %v", c.cfg.LocalAddr, err)
-		_ = workConn.Close()
-		return
-	}
-
-	go func() { _ = protocol.Pipe(workConn, localConn) }()
-	_ = protocol.Pipe(localConn, workConn)
 }
