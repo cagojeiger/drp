@@ -1,3 +1,6 @@
 [submodule ".repos/frp"]
 	path = .repos/frp
 	url = https://github.com/fatedier/frp
+[submodule ".repos/calico"]
+	path = .repos/calico
+	url = https://github.com/projectcalico/calico.git

@@ -39,11 +39,11 @@ Proposed | Accepted | Superseded by [ADR-XXX](./XXX-xxx.md)
 
 | ADR | 제목 | 핵심 질문 |
 |-----|------|----------|
-| 001 | 스코프와 철학 | 뭘 하고 뭘 안 하나? |
+| 001 | 스코프와 철학 | 뭘 하고 뭘 안 하나? 어떤 기술을 쓰나? |
 | 002 | 호스트 기반 라우팅 | 요청을 어떤 서비스로 보내나? |
-| 003 | 서버 메시와 서비스 검색 | 서버들이 어떻게 협력하나? |
-| 004 | 프로토콜과 메시지 | 컴포넌트가 뭘로 대화하나? |
-| 005 | Mesh 전송 계층 — QUIC | mesh를 뭘로 연결하나? |
+| 003 | 서버 메시와 서비스 검색 | 서버들이 어떻게 협력하나? (SWIM+Gossip) |
+| 004 | 프로토콜과 메시지 | 컴포넌트가 뭘로 대화하나? (Protocol Buffers) |
+| 005 | Mesh 전송 계층 — QUIC | relay를 뭘로 전송하나? |
 
 ## 핵심 설계 결정
 
@@ -51,16 +51,16 @@ Proposed | Accepted | Superseded by [ADR-XXX](./XXX-xxx.md)
 |------|------|------|
 | 프로토콜 스코프 | HTTP/HTTPS만 | 하나만 잘 한다 |
 | 라우팅 | Host 헤더 / TLS SNI | 포트 2개로 무제한 서비스 |
-| 분산 상태 | Server Mesh (broadcast + relay) | 외부 의존성 제로 |
-| 메시지 포맷 | TLV + JSON | 디버깅 용이. 기술 비종속 |
-| Mesh 전송 | QUIC (drps↔drps), TCP (drpc↔drps) | 멀티플렉싱, HoL blocking 해소 |
+| 멤버십 + 서비스 검색 | SWIM+Gossip (memberlist) | O(1) 검색, 자동 장애 감지, Consul 검증 |
+| 메시지 포맷 | Protocol Buffers | 스키마 진화, 타입 안전, 하위 호환 |
+| Mesh 전송 | QUIC (drps↔drps relay), TCP (drpc↔drps) | 멀티플렉싱, HoL blocking 해소 |
 | HA | 기본 1개 연결, 선택적 HA | mesh가 라우팅. HA는 fault tolerance 옵션 |
 
 ## 코드 컨벤션
 
 - 모듈: `github.com/cagojeiger/drp`
 - 스코프: **HTTP/HTTPS 전용**
-- 원칙: 외부 의존성 제로, 인프라 중립, 기술 비종속
+- 원칙: 인프라 의존성 제로, 검증된 기술 우선, 인프라 중립
 
 ## 참고 소스
 
