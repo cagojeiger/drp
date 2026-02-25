@@ -8,43 +8,57 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
+	"syscall"
 
 	"github.com/cagojeiger/drp/internal/server"
 )
 
 func main() {
 	nodeID := flag.String("node-id", "", "unique node identifier")
-	httpPort := flag.Int("http-port", 80, "HTTP listener port")
-	controlPort := flag.Int("control-port", 9000, "control + mesh port")
-	peers := flag.String("peers", "", "comma-separated peer addresses (host:port)")
-	verbose := flag.Bool("v", false, "verbose logging")
-	help := flag.Bool("help", false, "show help")
+	httpAddr := flag.String("http", ":80", "HTTP listen address")
+	httpsAddr := flag.String("https", ":443", "HTTPS listen address")
+	controlAddr := flag.String("control", ":9000", "drpc control listen address")
+	quicAddr := flag.String("quic", ":9001", "QUIC relay listen address")
+	meshBindAddr := flag.String("mesh-bind", "0.0.0.0", "memberlist bind address")
+	meshBindPort := flag.Int("mesh-port", 7946, "memberlist bind port")
+	joinPeers := flag.String("join", "", "comma-separated list of mesh peers to join")
 
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: drps [options]\n\nOptions:\n")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
-	if *help {
-		flag.Usage()
-		os.Exit(0)
-	}
-
 	if *nodeID == "" {
-		fmt.Fprintln(os.Stderr, "error: --node-id is required")
+		flag.Usage()
 		os.Exit(1)
 	}
 
-	srv := server.New(server.Config{
-		NodeID:      *nodeID,
-		HTTPPort:    *httpPort,
-		ControlPort: *controlPort,
-		Peers:       *peers,
-		Verbose:     *verbose,
-	})
+	var peers []string
+	if *joinPeers != "" {
+		peers = strings.Split(*joinPeers, ",")
+	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	cfg := server.ServerConfig{
+		NodeID:       *nodeID,
+		HTTPAddr:     *httpAddr,
+		HTTPSAddr:    *httpsAddr,
+		ControlAddr:  *controlAddr,
+		QuicAddr:     *quicAddr,
+		MeshBindAddr: *meshBindAddr,
+		MeshBindPort: *meshBindPort,
+		JoinPeers:    peers,
+	}
 
-	if err := srv.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		cancel()
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	s := server.New(cfg)
+	if err := s.Run(ctx); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		log.Fatal(err)
 	}
-	cancel()
 }

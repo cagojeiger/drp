@@ -1,148 +1,507 @@
+// Package server implements the drps server.
+// It integrates mesh, QUIC relay, control protocol and HTTP/HTTPS routing
+// into a single runnable component.
 package server
 
 import (
-	"bytes"
+	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
+	drppb "github.com/cagojeiger/drp/proto/drp"
+
 	"github.com/cagojeiger/drp/internal/mesh"
 	"github.com/cagojeiger/drp/internal/protocol"
+	"github.com/cagojeiger/drp/internal/registry"
+	"github.com/cagojeiger/drp/internal/relay"
 	"github.com/cagojeiger/drp/internal/transport"
 )
 
+// ServerConfig holds all server startup parameters.
+type ServerConfig struct {
+	NodeID       string
+	HTTPAddr     string // default ":80", use ":0" in tests
+	HTTPSAddr    string // default ":443", use ":0" in tests
+	ControlAddr  string // default ":9000", use ":0" in tests
+	QuicAddr     string // default ":9001", use ":0" in tests
+	MeshBindAddr string // default "0.0.0.0"
+	MeshBindPort int    // default 7946, use 0 in tests
+	JoinPeers    []string
+}
+
+// ServerAddrs holds the resolved listen addresses after startup.
+type ServerAddrs struct {
+	HTTP    string
+	HTTPS   string
+	Control string
+	QUIC    string
+	Mesh    string
+}
+
+// serviceEntry tracks a connected drpc client session.
 type serviceEntry struct {
 	alias     string
+	hostname  string
 	ctrlConn  net.Conn
-	workQueue chan net.Conn
+	workQueue chan net.Conn // buffered channel for incoming work connections
 }
 
-type Config struct {
-	NodeID      string
-	HTTPPort    int
-	ControlPort int
-	Peers       string
-	Verbose     bool
-}
-
+// Server is the central drps component.
 type Server struct {
-	cfg      Config
-	localMap map[string]*serviceEntry
-	mapMu    sync.RWMutex
-	mesh     *mesh.MeshManager
-	ready    chan struct{}
-	httpAddr string
-	ctrlAddr string
+	cfg      ServerConfig
+	registry *registry.Registry
+	mesh     *mesh.Mesh
+	relay    *relay.RelayManager
+
+	mu       sync.RWMutex
+	services map[string]*serviceEntry // key = proxy_alias
+
+	httpLn  net.Listener
+	httpsLn net.Listener
+	ctrlLn  net.Listener
+
+	ready chan struct{}
 }
 
-func New(cfg Config) *Server {
-	s := &Server{
+// New creates a Server with sensible defaults filled in.
+func New(cfg ServerConfig) *Server {
+	if cfg.HTTPAddr == "" {
+		cfg.HTTPAddr = ":80"
+	}
+	if cfg.HTTPSAddr == "" {
+		cfg.HTTPSAddr = ":443"
+	}
+	if cfg.ControlAddr == "" {
+		cfg.ControlAddr = ":9000"
+	}
+	if cfg.QuicAddr == "" {
+		cfg.QuicAddr = ":9001"
+	}
+	if cfg.MeshBindAddr == "" {
+		cfg.MeshBindAddr = "0.0.0.0"
+	}
+	// MeshBindPort 0 means "pick a random port" (for tests).
+	// Production default (7946) is set in cmd/drps/main.go flags.
+	return &Server{
 		cfg:      cfg,
-		localMap: make(map[string]*serviceEntry),
+		services: make(map[string]*serviceEntry),
 		ready:    make(chan struct{}),
 	}
-	s.mesh = mesh.New(cfg.NodeID, cfg.ControlPort, s.hasHostname, s.getWorkConn, transport.TCP{})
-	return s
 }
 
+// Run starts the server and blocks until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
-	httpLn, err := transport.Listen(fmt.Sprintf(":%d", s.cfg.HTTPPort))
+	// 1. Registry
+	s.registry = registry.New()
+
+	// 2. Mesh
+	s.mesh = mesh.New(mesh.MeshConfig{
+		NodeID:   s.cfg.NodeID,
+		BindAddr: s.cfg.MeshBindAddr,
+		BindPort: s.cfg.MeshBindPort,
+	}, s.registry)
+	if err := s.mesh.Create(); err != nil {
+		return fmt.Errorf("mesh create: %w", err)
+	}
+
+	// 3. QUIC relay
+	cert, err := relay.GenerateSelfSignedCert()
+	if err != nil {
+		return fmt.Errorf("generate cert: %w", err)
+	}
+	s.relay = relay.NewRelayManager(cert)
+	if err := s.relay.Listen(s.cfg.QuicAddr); err != nil {
+		return fmt.Errorf("quic listen: %w", err)
+	}
+
+	_, quicPort, _ := net.SplitHostPort(s.relay.Addr().String())
+	quicAdvertise := net.JoinHostPort(s.cfg.MeshBindAddr, quicPort)
+	s.mesh.SetQuicAddr(quicAdvertise)
+
+	// 4. TCP listeners
+	s.httpLn, err = transport.Listen(s.cfg.HTTPAddr)
 	if err != nil {
 		return fmt.Errorf("http listen: %w", err)
 	}
-	defer func() { _ = httpLn.Close() }()
-
-	ctrlLn, err := transport.Listen(fmt.Sprintf(":%d", s.cfg.ControlPort))
+	s.httpsLn, err = transport.Listen(s.cfg.HTTPSAddr)
+	if err != nil {
+		return fmt.Errorf("https listen: %w", err)
+	}
+	s.ctrlLn, err = transport.Listen(s.cfg.ControlAddr)
 	if err != nil {
 		return fmt.Errorf("control listen: %w", err)
 	}
-	defer func() { _ = ctrlLn.Close() }()
 
-	s.httpAddr = httpLn.Addr().String()
-	s.ctrlAddr = ctrlLn.Addr().String()
-	log.Printf("[drps-%s] HTTP on %s, Control on %s", s.cfg.NodeID, s.httpAddr, s.ctrlAddr)
-
-	if s.cfg.Peers != "" {
-		peers := strings.Split(s.cfg.Peers, ",")
-		for i := range peers {
-			peers[i] = strings.TrimSpace(peers[i])
+	// 5. Join mesh peers
+	if len(s.cfg.JoinPeers) > 0 {
+		if _, err := s.mesh.Join(s.cfg.JoinPeers); err != nil {
+			log.Printf("mesh join warning: %v", err)
 		}
-		s.mesh.ConnectToPeers(peers)
 	}
 
+	// 6. Ready
 	close(s.ready)
-	log.Printf("[drps-%s] ready", s.cfg.NodeID)
 
-	go s.acceptLoop(httpLn, s.handleHTTP)
-	go s.acceptLoop(ctrlLn, s.handleControl)
+	// 7. Accept loops
+	go s.acceptLoop(ctx, s.httpLn, s.handleHTTP)
+	go s.acceptLoop(ctx, s.httpsLn, s.handleHTTPS)
+	go s.acceptLoop(ctx, s.ctrlLn, s.handleControl)
+	go s.relayAcceptLoop(ctx)
 
+	// 8. Block until context done
 	<-ctx.Done()
-	return ctx.Err()
+
+	// 9. Cleanup
+	s.mesh.Leave(3 * time.Second)
+	s.relay.Close()
+	s.httpLn.Close()
+	s.httpsLn.Close()
+	s.ctrlLn.Close()
+	return nil
 }
 
-func (s *Server) Ready() <-chan struct{} {
-	return s.ready
+// Ready returns a channel that is closed once all listeners are up.
+func (s *Server) Ready() <-chan struct{} { return s.ready }
+
+// Addr returns all resolved listen addresses. Only valid after Ready fires.
+func (s *Server) Addr() ServerAddrs {
+	return ServerAddrs{
+		HTTP:    s.httpLn.Addr().String(),
+		HTTPS:   s.httpsLn.Addr().String(),
+		Control: s.ctrlLn.Addr().String(),
+		QUIC:    s.relay.Addr().String(),
+		Mesh:    s.mesh.LocalAddr(),
+	}
 }
 
-func (s *Server) Addr() (httpAddr, ctrlAddr string) {
-	return s.httpAddr, s.ctrlAddr
+// Lookup delegates to the mesh for external callers (e.g. e2e tests).
+func (s *Server) Lookup(hostname string) (registry.ServiceInfo, bool) {
+	return s.mesh.Lookup(hostname)
 }
 
-func (s *Server) acceptLoop(ln net.Listener, handler func(net.Conn)) {
+// ---------- accept loops ----------
+
+func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, handler func(net.Conn)) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			// Listener was closed during shutdown.
 			return
 		}
 		go handler(conn)
 	}
 }
 
-func (s *Server) handleHTTP(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
-
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 4096)
-	for !bytes.Contains(buf, []byte("\r\n\r\n")) {
-		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-		n, err := conn.Read(tmp)
+func (s *Server) relayAcceptLoop(ctx context.Context) {
+	for {
+		conn, err := s.relay.Accept(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("relay accept error: %v", err)
 			return
 		}
-		buf = append(buf, tmp[:n]...)
-		if len(buf) > 65536 {
-			_, _ = conn.Write([]byte("HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n"))
-			return
-		}
+		go s.handleRelayConn(conn)
 	}
-	_ = conn.SetReadDeadline(time.Time{})
+}
+
+// ---------- HTTP/HTTPS ----------
+
+func (s *Server) handleHTTP(conn net.Conn) {
+	defer conn.Close()
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return
+	}
+	buf = buf[:n]
 
 	hostname := protocol.ExtractHost(buf)
 	if hostname == "" {
-		_, _ = conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"))
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 15\r\n\r\n400 Bad Request"))
 		return
 	}
 
-	s.mapMu.RLock()
-	entry, local := s.localMap[hostname]
-	s.mapMu.RUnlock()
-
-	if local {
-		s.handleLocalHit(conn, buf, hostname, entry)
-		return
-	}
-
-	s.handleMeshRelay(conn, buf, hostname)
+	s.routeRequest(hostname, conn, buf)
 }
 
-func (s *Server) handleLocalHit(conn net.Conn, buf []byte, hostname string, entry *serviceEntry) {
-	if err := protocol.WriteMsg(entry.ctrlConn, protocol.MsgReqWorkConn, &protocol.ReqWorkConnBody{}); err != nil {
-		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+func (s *Server) handleHTTPS(conn net.Conn) {
+	defer conn.Close()
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return
+	}
+	buf = buf[:n]
+
+	hostname := protocol.ExtractSNI(buf)
+	if hostname == "" {
+		return // Can't route without SNI
+	}
+
+	s.routeRequest(hostname, conn, buf)
+}
+
+// ---------- routing ----------
+
+func (s *Server) routeRequest(hostname string, userConn net.Conn, buffered []byte) {
+	info, found := s.mesh.Lookup(hostname)
+	if !found {
+		userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+		return
+	}
+
+	if info.IsLocal {
+		s.localRoute(info, userConn, buffered)
+	} else {
+		s.remoteRelay(info, userConn, buffered)
+	}
+}
+
+func (s *Server) localRoute(info registry.ServiceInfo, userConn net.Conn, buf []byte) {
+	s.mu.RLock()
+	entry, ok := s.services[info.ProxyAlias]
+	s.mu.RUnlock()
+	if !ok {
+		userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+		return
+	}
+
+	// Request a work connection from the client.
+	if err := protocol.WriteEnvelope(entry.ctrlConn, &drppb.Envelope{
+		Payload: &drppb.Envelope_ReqWorkConn{ReqWorkConn: &drppb.ReqWorkConn{
+			ProxyAlias: info.ProxyAlias,
+		}},
+	}); err != nil {
+		log.Printf("req work conn write error: %v", err)
+		userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+		return
+	}
+
+	// Wait for the work connection to arrive.
+	var workConn net.Conn
+	select {
+	case workConn = <-entry.workQueue:
+	case <-time.After(10 * time.Second):
+		userConn.Write([]byte("HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 19\r\n\r\n504 Gateway Timeout"))
+		return
+	}
+	defer workConn.Close()
+
+	// Tell the client which proxy this work connection is for.
+	protocol.WriteEnvelope(workConn, &drppb.Envelope{
+		Payload: &drppb.Envelope_StartWorkConn{StartWorkConn: &drppb.StartWorkConn{
+			ProxyAlias: info.ProxyAlias,
+		}},
+	})
+
+	// Flush the buffered initial bytes.
+	workConn.Write(buf)
+
+	// Bidirectional pipe.
+	go protocol.Pipe(userConn, workConn)
+	protocol.Pipe(workConn, userConn)
+}
+
+func (s *Server) remoteRelay(info registry.ServiceInfo, userConn net.Conn, buf []byte) {
+	peerAddr := s.resolvePeerQuicAddr(info.NodeID)
+	if peerAddr == "" {
+		userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stream, err := s.relay.DialStream(ctx, peerAddr)
+	if err != nil {
+		log.Printf("relay dial to %s (%s) failed: %v", info.NodeID, peerAddr, err)
+		userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+		return
+	}
+	defer stream.Close()
+
+	// Send RelayOpen header so the receiving node knows which proxy to invoke.
+	protocol.WriteEnvelope(stream, &drppb.Envelope{
+		Payload: &drppb.Envelope_RelayOpen{RelayOpen: &drppb.RelayOpen{
+			ProxyAlias: info.ProxyAlias,
+			RequestId:  fmt.Sprintf("%d", time.Now().UnixNano()),
+		}},
+	})
+
+	stream.Write(buf)
+
+	go protocol.Pipe(userConn, stream)
+	protocol.Pipe(stream, userConn)
+}
+
+func (s *Server) resolvePeerQuicAddr(nodeID string) string {
+	for _, member := range s.mesh.Members() {
+		if member.Name != nodeID {
+			continue
+		}
+		meta := make([]byte, len(member.Meta))
+		copy(meta, member.Meta)
+		var ns drppb.NodeServices
+		if err := proto.Unmarshal(meta, &ns); err != nil || ns.QuicAddr == "" {
+			_, quicPort, _ := net.SplitHostPort(s.relay.Addr().String())
+			return fmt.Sprintf("%s:%s", member.Addr, quicPort)
+		}
+		return ns.QuicAddr
+	}
+	return ""
+}
+
+// ---------- control protocol ----------
+
+func (s *Server) handleControl(conn net.Conn) {
+	r := bufio.NewReader(conn)
+	env, err := protocol.ReadEnvelope(r)
+	if err != nil {
+		conn.Close()
+		return
+	}
+
+	switch p := env.Payload.(type) {
+	case *drppb.Envelope_Login:
+		s.clientSession(conn, r, p.Login)
+	case *drppb.Envelope_NewWorkConn:
+		s.acceptWorkConn(conn, p.NewWorkConn)
+	default:
+		log.Printf("unexpected control message: %T", p)
+		conn.Close()
+	}
+}
+
+func (s *Server) clientSession(conn net.Conn, r *bufio.Reader, login *drppb.Login) {
+	// Accept all logins for now.
+	if err := protocol.WriteEnvelope(conn, &drppb.Envelope{
+		Payload: &drppb.Envelope_LoginResp{LoginResp: &drppb.LoginResp{Ok: true}},
+	}); err != nil {
+		conn.Close()
+		return
+	}
+
+	// Read NewProxy.
+	env, err := protocol.ReadEnvelope(r)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	proxy := env.GetNewProxy()
+	if proxy == nil {
+		conn.Close()
+		return
+	}
+
+	// Track the service.
+	entry := &serviceEntry{
+		alias:     proxy.Alias,
+		hostname:  proxy.Hostname,
+		ctrlConn:  conn,
+		workQueue: make(chan net.Conn, 10),
+	}
+
+	s.mu.Lock()
+	s.services[proxy.Alias] = entry
+	s.mu.Unlock()
+
+	s.mesh.RegisterService(proxy.Alias, proxy.Hostname)
+
+	if err := protocol.WriteEnvelope(conn, &drppb.Envelope{
+		Payload: &drppb.Envelope_NewProxyResp{NewProxyResp: &drppb.NewProxyResp{Ok: true}},
+	}); err != nil {
+		s.mu.Lock()
+		delete(s.services, proxy.Alias)
+		s.mu.Unlock()
+		s.mesh.UnregisterService(proxy.Hostname)
+		conn.Close()
+		return
+	}
+
+	// Control loop — handle heartbeats and detect disconnection.
+	defer func() {
+		s.mu.Lock()
+		delete(s.services, proxy.Alias)
+		s.mu.Unlock()
+		s.mesh.UnregisterService(proxy.Hostname)
+		conn.Close()
+	}()
+
+	for {
+		env, err := protocol.ReadEnvelope(r)
+		if err != nil {
+			return // client disconnected
+		}
+		switch env.Payload.(type) {
+		case *drppb.Envelope_Ping:
+			protocol.WriteEnvelope(conn, &drppb.Envelope{
+				Payload: &drppb.Envelope_Pong{Pong: &drppb.Pong{}},
+			})
+		default:
+			log.Printf("unexpected message in client session: %T", env.Payload)
+		}
+	}
+}
+
+func (s *Server) acceptWorkConn(conn net.Conn, nwc *drppb.NewWorkConn) {
+	s.mu.RLock()
+	entry, ok := s.services[nwc.ProxyAlias]
+	s.mu.RUnlock()
+	if !ok {
+		conn.Close()
+		return
+	}
+
+	select {
+	case entry.workQueue <- conn:
+	case <-time.After(10 * time.Second):
+		conn.Close()
+	}
+}
+
+// ---------- relay accept ----------
+
+func (s *Server) handleRelayConn(conn net.Conn) {
+	defer conn.Close()
+
+	r := bufio.NewReader(conn)
+	env, err := protocol.ReadEnvelope(r)
+	if err != nil {
+		return
+	}
+
+	ro := env.GetRelayOpen()
+	if ro == nil {
+		return
+	}
+
+	s.mu.RLock()
+	entry, ok := s.services[ro.ProxyAlias]
+	s.mu.RUnlock()
+	if !ok {
+		log.Printf("relay: service %s not found locally", ro.ProxyAlias)
+		return
+	}
+
+	// Request a work connection from the client.
+	if err := protocol.WriteEnvelope(entry.ctrlConn, &drppb.Envelope{
+		Payload: &drppb.Envelope_ReqWorkConn{ReqWorkConn: &drppb.ReqWorkConn{
+			ProxyAlias: ro.ProxyAlias,
+		}},
+	}); err != nil {
 		return
 	}
 
@@ -150,207 +509,16 @@ func (s *Server) handleLocalHit(conn net.Conn, buf []byte, hostname string, entr
 	select {
 	case workConn = <-entry.workQueue:
 	case <-time.After(10 * time.Second):
-		_, _ = conn.Write([]byte("HTTP/1.1 504 Gateway Timeout\r\n\r\n"))
 		return
 	}
+	defer workConn.Close()
 
-	if err := protocol.WriteMsg(workConn, protocol.MsgStartWorkConn, &protocol.StartWorkConnBody{Hostname: hostname}); err != nil {
-		_ = workConn.Close()
-		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		return
-	}
+	protocol.WriteEnvelope(workConn, &drppb.Envelope{
+		Payload: &drppb.Envelope_StartWorkConn{StartWorkConn: &drppb.StartWorkConn{
+			ProxyAlias: ro.ProxyAlias,
+		}},
+	})
 
-	if _, err := workConn.Write(buf); err != nil {
-		_ = workConn.Close()
-		return
-	}
-
-	go func() { _ = protocol.Pipe(conn, workConn) }()
-	_ = protocol.Pipe(workConn, conn)
-}
-
-func (s *Server) handleMeshRelay(conn net.Conn, buf []byte, hostname string) {
-	result, err := s.mesh.FindService(hostname)
-	if err != nil || result == nil {
-		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"))
-		return
-	}
-
-	targetNode := result.NodeID
-	whoPath := result.Path
-
-	var relayPath []string
-	if len(whoPath) > 1 {
-		relayPath = append(relayPath, whoPath[1:]...)
-	}
-	relayPath = append(relayPath, targetNode)
-
-	relayConn, err := s.mesh.OpenRelay(hostname, targetNode, relayPath)
-	if err != nil {
-		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-
-	if _, err := relayConn.Write(buf); err != nil {
-		_ = relayConn.Close()
-		return
-	}
-
-	go func() { _ = protocol.Pipe(conn, relayConn) }()
-	_ = protocol.Pipe(relayConn, conn)
-}
-
-func (s *Server) handleControl(conn net.Conn) {
-	msgType, body, err := protocol.ReadMsg(conn)
-	if err != nil {
-		_ = conn.Close()
-		return
-	}
-
-	switch msgType {
-	case protocol.MsgLogin:
-		var lb protocol.LoginBody
-		if len(body) > 0 {
-			_ = json.Unmarshal(body, &lb)
-		}
-		s.clientSession(conn, &lb)
-
-	case protocol.MsgMeshHello:
-		var hb protocol.MeshHelloBody
-		if len(body) > 0 {
-			_ = json.Unmarshal(body, &hb)
-		}
-		s.mesh.HandlePeer(conn, &hb)
-
-	case protocol.MsgNewWorkConn:
-		var wb protocol.NewWorkConnBody
-		if len(body) > 0 {
-			_ = json.Unmarshal(body, &wb)
-		}
-		s.acceptWorkConn(conn, &wb)
-
-	case protocol.MsgRelayOpen:
-		var rb protocol.RelayOpenBody
-		if len(body) > 0 {
-			_ = json.Unmarshal(body, &rb)
-		}
-		s.mesh.HandleRelayOpen(conn, &rb)
-
-	default:
-		_ = conn.Close()
-	}
-}
-
-func (s *Server) clientSession(conn net.Conn, login *protocol.LoginBody) {
-	alias := login.Alias
-	if alias == "" {
-		alias = "unknown"
-	}
-
-	if err := protocol.WriteMsg(conn, protocol.MsgLoginResp, &protocol.LoginRespBody{OK: true, Message: "ok"}); err != nil {
-		_ = conn.Close()
-		return
-	}
-	log.Printf("[drps-%s] client %s logged in", s.cfg.NodeID, alias)
-
-	msgType, body, err := protocol.ReadMsg(conn)
-	if err != nil || msgType != protocol.MsgNewProxy {
-		_ = conn.Close()
-		return
-	}
-
-	var np protocol.NewProxyBody
-	if len(body) > 0 {
-		_ = json.Unmarshal(body, &np)
-	}
-
-	if np.Hostname == "" {
-		_ = protocol.WriteMsg(conn, protocol.MsgNewProxyResp, &protocol.NewProxyRespBody{OK: false, Message: "missing hostname"})
-		_ = conn.Close()
-		return
-	}
-
-	entry := &serviceEntry{
-		alias:     np.Alias,
-		ctrlConn:  conn,
-		workQueue: make(chan net.Conn, 64),
-	}
-
-	s.mapMu.Lock()
-	s.localMap[np.Hostname] = entry
-	s.mapMu.Unlock()
-
-	if err := protocol.WriteMsg(conn, protocol.MsgNewProxyResp, &protocol.NewProxyRespBody{OK: true, Message: "ok"}); err != nil {
-		s.mapMu.Lock()
-		delete(s.localMap, np.Hostname)
-		s.mapMu.Unlock()
-		_ = conn.Close()
-		return
-	}
-	log.Printf("[drps-%s] registered %s -> %s", s.cfg.NodeID, alias, np.Hostname)
-
-	defer func() {
-		s.mapMu.Lock()
-		delete(s.localMap, np.Hostname)
-		s.mapMu.Unlock()
-		_ = conn.Close()
-		log.Printf("[drps-%s] client %s (%s) disconnected", s.cfg.NodeID, alias, np.Hostname)
-	}()
-
-	for {
-		_, _, err := protocol.ReadMsg(conn)
-		if err != nil {
-			return
-		}
-	}
-}
-
-func (s *Server) acceptWorkConn(conn net.Conn, body *protocol.NewWorkConnBody) {
-	alias := body.Alias
-
-	s.mapMu.RLock()
-	for _, entry := range s.localMap {
-		if entry.alias == alias {
-			s.mapMu.RUnlock()
-			select {
-			case entry.workQueue <- conn:
-			default:
-				_ = conn.Close()
-			}
-			return
-		}
-	}
-	s.mapMu.RUnlock()
-	_ = conn.Close()
-}
-
-func (s *Server) hasHostname(hostname string) bool {
-	s.mapMu.RLock()
-	defer s.mapMu.RUnlock()
-	_, ok := s.localMap[hostname]
-	return ok
-}
-
-func (s *Server) getWorkConn(hostname string) (net.Conn, error) {
-	s.mapMu.RLock()
-	entry, ok := s.localMap[hostname]
-	s.mapMu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("no local service for %s", hostname)
-	}
-
-	if err := protocol.WriteMsg(entry.ctrlConn, protocol.MsgReqWorkConn, &protocol.ReqWorkConnBody{}); err != nil {
-		return nil, err
-	}
-
-	select {
-	case workConn := <-entry.workQueue:
-		if err := protocol.WriteMsg(workConn, protocol.MsgStartWorkConn, &protocol.StartWorkConnBody{Hostname: hostname}); err != nil {
-			_ = workConn.Close()
-			return nil, err
-		}
-		return workConn, nil
-	case <-time.After(10 * time.Second):
-		return nil, fmt.Errorf("work conn timeout for %s", hostname)
-	}
+	go protocol.Pipe(conn, workConn)
+	protocol.Pipe(workConn, r)
 }
