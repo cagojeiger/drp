@@ -1,0 +1,93 @@
+syntax = "proto3";
+package drp.v1;
+option go_package = "github.com/cagojeiger/drp/proto/drp";
+
+// ─── Envelope ──────────────────────────────────
+// 모든 제어 메시지를 하나의 프레임으로 감싸는 컨테이너.
+// oneof로 메시지 타입을 구분한다.
+
+message Envelope {
+    oneof payload {
+        // 클라이언트 → 서버
+        Login login = 1;
+        NewProxy new_proxy = 2;
+        NewWorkConn new_work_conn = 3;
+        Ping ping = 4;
+
+        // 서버 → 클라이언트
+        LoginResp login_resp = 10;
+        NewProxyResp new_proxy_resp = 11;
+        ReqWorkConn req_work_conn = 12;
+        StartWorkConn start_work_conn = 13;
+        Pong pong = 14;
+
+        // 서버 ↔ 서버 (QUIC relay)
+        RelayOpen relay_open = 20;
+    }
+}
+
+// ─── 클라이언트 → 서버 ──────────────────────────
+
+message Login {
+    string api_key = 1;
+    string version = 2;
+}
+
+message NewProxy {
+    string alias = 1;
+    string hostname = 2;
+    string type = 3;         // "http" | "https"
+}
+
+message NewWorkConn {
+    string proxy_alias = 1;
+}
+
+message Ping {}
+
+// ─── 서버 → 클라이언트 ──────────────────────────
+
+message LoginResp {
+    bool ok = 1;
+    string error = 2;
+}
+
+message NewProxyResp {
+    bool ok = 1;
+    string error = 2;
+}
+
+message ReqWorkConn {
+    string proxy_alias = 1;
+}
+
+message StartWorkConn {
+    string proxy_alias = 1;
+}
+
+message Pong {}
+
+// ─── 서버 ↔ 서버 (QUIC relay stream) ───────────
+
+message RelayOpen {
+    string proxy_alias = 1;
+    string request_id = 2;
+}
+
+// ─── 서버 ↔ 서버 (memberlist gossip) ────────────
+// memberlist Delegate를 통해 전파. Envelope과 별개 경로.
+
+message ServiceUpdate {
+    string node_id = 1;
+    string action = 2;       // "add" | "remove"
+    string proxy_alias = 3;
+    string hostname = 4;
+}
+
+// ─── memberlist NodeMeta (≤512 bytes) ───────────
+// Delegate.NodeMeta()에서 인코딩, EventDelegate.NotifyJoin/Update에서 디코딩.
+
+message NodeServices {
+    repeated string hostnames = 1;
+    string quic_addr = 2;    // e.g. "10.0.0.1:9001"
+}
