@@ -1,440 +1,182 @@
 package mesh
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
-	"log"
-	"net"
 	"sync"
 	"time"
 
-	"github.com/cagojeiger/drp/internal/protocol"
-	"github.com/cagojeiger/drp/internal/transport"
+	"github.com/hashicorp/memberlist"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/cagojeiger/drp/internal/registry"
+	drppb "github.com/cagojeiger/drp/proto/drp"
 )
 
-type GetWorkConnFunc func(hostname string) (net.Conn, error)
-
-type MeshManager struct {
-	nodeID      string
-	controlPort int
-	dialer      transport.Dialer
-
-	hasHostname func(string) bool
-	getWorkConn GetWorkConnFunc
-
-	peers         map[string]net.Conn
-	peerAddresses map[string]string
-	seenMessages  map[string]time.Time
-	pending       map[string]chan *protocol.IHaveBody
-	inflight      map[string]chan *protocol.IHaveBody
-	mu            sync.RWMutex
+type MeshConfig struct {
+	NodeID   string
+	BindAddr string
+	BindPort int
+	QuicAddr string
 }
 
-func New(nodeID string, controlPort int, hasHostname func(string) bool, getWorkConn GetWorkConnFunc, dialer transport.Dialer) *MeshManager {
-	return &MeshManager{
-		nodeID:        nodeID,
-		controlPort:   controlPort,
-		dialer:        dialer,
-		hasHostname:   hasHostname,
-		getWorkConn:   getWorkConn,
-		peers:         make(map[string]net.Conn),
-		peerAddresses: make(map[string]string),
-		seenMessages:  make(map[string]time.Time),
-		pending:       make(map[string]chan *protocol.IHaveBody),
-		inflight:      make(map[string]chan *protocol.IHaveBody),
+type Mesh struct {
+	config   MeshConfig
+	list     *memberlist.Memberlist
+	delegate *DrpDelegate
+	registry *registry.Registry
+
+	updateMu  sync.Mutex
+	leaveOnce sync.Once
+	leaveErr  error
+}
+
+const removeBroadcastAttempts = 5
+
+func New(cfg MeshConfig, reg *registry.Registry) *Mesh {
+	delegate := NewDrpDelegate(cfg.NodeID, reg)
+	if cfg.BindAddr == "" {
+		cfg.BindAddr = "0.0.0.0"
+	}
+
+	return &Mesh{
+		config:   cfg,
+		delegate: delegate,
+		registry: reg,
 	}
 }
 
-func (m *MeshManager) ConnectToPeers(specs []string) {
-	for _, spec := range specs {
-		if spec == "" {
-			continue
-		}
-		conn, err := m.dialer.Dial(spec)
-		if err != nil {
-			log.Printf("[mesh-%s] failed connecting to peer %s: %v", m.nodeID, spec, err)
-			continue
+func (m *Mesh) Create() error {
+	mlCfg := memberlist.DefaultLANConfig()
+	mlCfg.Name = m.config.NodeID
+	mlCfg.BindAddr = m.config.BindAddr
+	mlCfg.BindPort = m.config.BindPort
+	mlCfg.AdvertisePort = m.config.BindPort
+	mlCfg.Delegate = m.delegate
+	mlCfg.Events = m.delegate
+	mlCfg.LogOutput = io.Discard
+
+	list, err := memberlist.Create(mlCfg)
+	if err != nil {
+		return err
+	}
+	m.list = list
+
+	m.delegate.SetBroadcastQueue(&memberlist.TransmitLimitedQueue{
+		NumNodes:       func() int { return m.list.NumMembers() },
+		RetransmitMult: mlCfg.RetransmitMult,
+	})
+
+	return nil
+}
+
+func (m *Mesh) Join(peers []string) (int, error) {
+	return m.list.Join(peers)
+}
+
+func (m *Mesh) Leave(timeout time.Duration) error {
+	if m.list == nil {
+		return nil
+	}
+
+	m.leaveOnce.Do(func() {
+		for _, svc := range m.registry.LocalServices() {
+			m.UnregisterService(svc.Hostname)
 		}
 
-		err = protocol.WriteMsg(conn, protocol.MsgMeshHello, &protocol.MeshHelloBody{
-			NodeID:      m.nodeID,
-			Peers:       []string{},
-			ControlPort: m.controlPort,
+		if err := m.list.Leave(timeout); err != nil {
+			m.leaveErr = err
+			return
+		}
+		m.leaveErr = m.list.Shutdown()
+	})
+
+	return m.leaveErr
+}
+
+func (m *Mesh) RegisterService(alias, hostname string) {
+	m.registry.Register(hostname, m.config.NodeID, alias, true)
+	m.delegate.BroadcastServiceUpdate(&drppb.ServiceUpdate{
+		NodeId:     m.config.NodeID,
+		Action:     "add",
+		ProxyAlias: alias,
+		Hostname:   hostname,
+	})
+	m.updateMu.Lock()
+	_ = m.list.UpdateNode(5 * time.Second)
+	m.updateMu.Unlock()
+}
+
+func (m *Mesh) UnregisterService(hostname string) {
+	info, found := m.registry.Lookup(hostname)
+	m.registry.Unregister(hostname)
+
+	proxyAlias := ""
+	if found {
+		proxyAlias = info.ProxyAlias
+	}
+
+	m.delegate.BroadcastServiceUpdate(&drppb.ServiceUpdate{
+		NodeId:     m.config.NodeID,
+		Action:     "remove",
+		ProxyAlias: proxyAlias,
+		Hostname:   hostname,
+	})
+	for i := 1; i < removeBroadcastAttempts; i++ {
+		m.delegate.BroadcastServiceUpdate(&drppb.ServiceUpdate{
+			NodeId:     m.config.NodeID,
+			Action:     "remove",
+			ProxyAlias: proxyAlias,
+			Hostname:   hostname,
 		})
-		if err != nil {
-			_ = conn.Close()
-			log.Printf("[mesh-%s] failed sending hello to %s: %v", m.nodeID, spec, err)
+	}
+	m.updateMu.Lock()
+	_ = m.list.UpdateNode(5 * time.Second)
+	m.updateMu.Unlock()
+}
+
+func (m *Mesh) Lookup(hostname string) (registry.ServiceInfo, bool) {
+	info, found := m.registry.Lookup(hostname)
+	if !found || info.IsLocal || m.list == nil {
+		return info, found
+	}
+
+	for _, member := range m.list.Members() {
+		if member.Name != info.NodeID {
 			continue
 		}
 
-		msgType, body, err := protocol.ReadMsg(conn)
-		if err != nil || msgType != protocol.MsgMeshHello {
-			_ = conn.Close()
-			log.Printf("[mesh-%s] invalid hello response from %s", m.nodeID, spec)
-			continue
+		meta := make([]byte, len(member.Meta))
+		copy(meta, member.Meta)
+		var ns drppb.NodeServices
+		if err := proto.Unmarshal(meta, &ns); err != nil {
+			m.registry.Unregister(hostname)
+			return registry.ServiceInfo{}, false
 		}
 
-		var hello protocol.MeshHelloBody
-		if len(body) > 0 {
-			if err := json.Unmarshal(body, &hello); err != nil {
-				_ = conn.Close()
-				continue
+		for _, h := range ns.Hostnames {
+			if h == hostname {
+				return info, true
 			}
 		}
 
-		if hello.NodeID == "" {
-			_ = conn.Close()
-			continue
-		}
-
-		m.mu.Lock()
-		m.peers[hello.NodeID] = conn
-		m.peerAddresses[hello.NodeID] = spec
-		m.mu.Unlock()
-
-		go m.peerLoop(hello.NodeID, conn)
-		log.Printf("[mesh-%s] connected to peer %s at %s", m.nodeID, hello.NodeID, spec)
+		m.registry.Unregister(hostname)
+		return registry.ServiceInfo{}, false
 	}
+
+	m.registry.Unregister(hostname)
+	return registry.ServiceInfo{}, false
 }
 
-func (m *MeshManager) HandlePeer(conn net.Conn, hello *protocol.MeshHelloBody) {
-	if hello == nil || hello.NodeID == "" {
-		_ = conn.Close()
-		return
-	}
-
-	err := protocol.WriteMsg(conn, protocol.MsgMeshHello, &protocol.MeshHelloBody{
-		NodeID:      m.nodeID,
-		Peers:       []string{},
-		ControlPort: m.controlPort,
-	})
-	if err != nil {
-		_ = conn.Close()
-		return
-	}
-
-	addr := conn.RemoteAddr().String()
-	if hello.ControlPort > 0 {
-		host, _, err := net.SplitHostPort(addr)
-		if err == nil {
-			addr = net.JoinHostPort(host, fmt.Sprintf("%d", hello.ControlPort))
-		}
-	}
-
-	m.mu.Lock()
-	m.peers[hello.NodeID] = conn
-	m.peerAddresses[hello.NodeID] = addr
-	m.mu.Unlock()
-
-	go m.peerLoop(hello.NodeID, conn)
-	log.Printf("[mesh-%s] accepted peer %s", m.nodeID, hello.NodeID)
+func (m *Mesh) SetQuicAddr(addr string) {
+	m.delegate.SetQuicAddr(addr)
 }
 
-func (m *MeshManager) peerLoop(peerID string, conn net.Conn) {
-	defer func() {
-		m.mu.Lock()
-		delete(m.peers, peerID)
-		m.mu.Unlock()
-		_ = conn.Close()
-	}()
-
-	for {
-		msgType, body, err := protocol.ReadMsg(conn)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("[mesh-%s] peer loop error for %s: %v", m.nodeID, peerID, err)
-			}
-			return
-		}
-
-		switch msgType {
-		case protocol.MsgWhoHas:
-			var wb protocol.WhoHasBody
-			if len(body) > 0 {
-				if err := json.Unmarshal(body, &wb); err != nil {
-					continue
-				}
-			}
-			m.handleWhoHas(peerID, &wb)
-		case protocol.MsgIHave:
-			var ib protocol.IHaveBody
-			if len(body) > 0 {
-				if err := json.Unmarshal(body, &ib); err != nil {
-					continue
-				}
-			}
-			m.handleIHave(&ib)
-		}
-	}
+func (m *Mesh) Members() []*memberlist.Node {
+	return m.list.Members()
 }
 
-func (m *MeshManager) handleWhoHas(senderID string, body *protocol.WhoHasBody) {
-	if body.MsgID == "" || body.Hostname == "" {
-		return
-	}
-
-	m.mu.Lock()
-	if _, seen := m.seenMessages[body.MsgID]; seen {
-		m.mu.Unlock()
-		return
-	}
-	m.markSeenLocked(body.MsgID)
-	m.mu.Unlock()
-
-	if body.TTL <= 0 {
-		return
-	}
-
-	if m.hasHostname(body.Hostname) {
-		resp := &protocol.IHaveBody{
-			MsgID:    body.MsgID,
-			Hostname: body.Hostname,
-			NodeID:   m.nodeID,
-			Path:     body.Path,
-		}
-		m.mu.RLock()
-		conn, ok := m.peers[senderID]
-		m.mu.RUnlock()
-		if ok {
-			_ = protocol.WriteMsg(conn, protocol.MsgIHave, resp)
-		}
-		return
-	}
-
-	forward := &protocol.WhoHasBody{
-		MsgID:    body.MsgID,
-		Hostname: body.Hostname,
-		TTL:      body.TTL - 1,
-		Path:     append(body.Path, m.nodeID),
-	}
-
-	m.mu.RLock()
-	for pid, conn := range m.peers {
-		if pid != senderID {
-			_ = protocol.WriteMsg(conn, protocol.MsgWhoHas, forward)
-		}
-	}
-	m.mu.RUnlock()
-}
-
-func (m *MeshManager) handleIHave(body *protocol.IHaveBody) {
-	if body.MsgID == "" {
-		return
-	}
-
-	m.mu.Lock()
-	ch, ok := m.pending[body.MsgID]
-	if ok {
-		delete(m.pending, body.MsgID)
-	}
-	m.mu.Unlock()
-
-	if ok {
-		select {
-		case ch <- body:
-		default:
-		}
-		return
-	}
-
-	if len(body.Path) == 0 {
-		return
-	}
-
-	myIdx := -1
-	for i, node := range body.Path {
-		if node == m.nodeID {
-			myIdx = i
-			break
-		}
-	}
-
-	if myIdx > 0 {
-		prevNode := body.Path[myIdx-1]
-		m.mu.RLock()
-		conn, ok := m.peers[prevNode]
-		m.mu.RUnlock()
-		if ok {
-			_ = protocol.WriteMsg(conn, protocol.MsgIHave, body)
-		}
-	}
-}
-
-func (m *MeshManager) FindService(hostname string) (*protocol.IHaveBody, error) {
-	m.mu.RLock()
-	peerCount := len(m.peers)
-	m.mu.RUnlock()
-
-	if peerCount == 0 {
-		return nil, fmt.Errorf("no peers")
-	}
-
-	m.mu.Lock()
-	existing, ok := m.inflight[hostname]
-	if ok {
-		m.mu.Unlock()
-		select {
-		case result := <-existing:
-			return result, nil
-		case <-time.After(3 * time.Second):
-			return nil, fmt.Errorf("timeout finding %s", hostname)
-		}
-	}
-
-	shared := make(chan *protocol.IHaveBody, 1)
-	m.inflight[hostname] = shared
-	m.mu.Unlock()
-
-	defer func() {
-		m.mu.Lock()
-		delete(m.inflight, hostname)
-		m.mu.Unlock()
-	}()
-
-	result, err := m.broadcast(hostname)
-	if result != nil {
-		select {
-		case shared <- result:
-		default:
-		}
-	}
-	return result, err
-}
-
-func (m *MeshManager) broadcast(hostname string) (*protocol.IHaveBody, error) {
-	msgID := protocol.GenerateID()
-	ch := make(chan *protocol.IHaveBody, 1)
-
-	m.mu.Lock()
-	m.pending[msgID] = ch
-	m.markSeenLocked(msgID)
-	m.mu.Unlock()
-
-	body := &protocol.WhoHasBody{
-		MsgID:    msgID,
-		Hostname: hostname,
-		TTL:      5,
-		Path:     []string{m.nodeID},
-	}
-
-	m.mu.RLock()
-	for _, conn := range m.peers {
-		_ = protocol.WriteMsg(conn, protocol.MsgWhoHas, body)
-	}
-	m.mu.RUnlock()
-
-	select {
-	case result := <-ch:
-		return result, nil
-	case <-time.After(3 * time.Second):
-		m.mu.Lock()
-		delete(m.pending, msgID)
-		m.mu.Unlock()
-		return nil, fmt.Errorf("no service found for %s (timeout)", hostname)
-	}
-}
-
-func (m *MeshManager) OpenRelay(hostname, targetNodeID string, path []string) (net.Conn, error) {
-	if len(path) == 0 {
-		return nil, fmt.Errorf("relay path is empty")
-	}
-
-	nextHop := path[0]
-	remaining := path[1:]
-
-	m.mu.RLock()
-	addr, ok := m.peerAddresses[nextHop]
-	m.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("unknown next hop: %s", nextHop)
-	}
-
-	conn, err := m.dialer.Dial(addr)
-	if err != nil {
-		return nil, fmt.Errorf("dial next hop %s (%s): %w", nextHop, addr, err)
-	}
-
-	err = protocol.WriteMsg(conn, protocol.MsgRelayOpen, &protocol.RelayOpenBody{
-		RelayID:  protocol.GenerateID(),
-		Hostname: hostname,
-		NextHops: remaining,
-	})
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-
-	return conn, nil
-}
-
-func (m *MeshManager) HandleRelayOpen(conn net.Conn, body *protocol.RelayOpenBody) {
-	if body.Hostname == "" || body.RelayID == "" {
-		_ = conn.Close()
-		return
-	}
-
-	if len(body.NextHops) == 0 {
-		workConn, err := m.getWorkConn(body.Hostname)
-		if err != nil {
-			log.Printf("[mesh-%s] relay %s: no work conn for %s: %v", m.nodeID, body.RelayID, body.Hostname, err)
-			_ = conn.Close()
-			return
-		}
-		go func() { _ = protocol.Pipe(conn, workConn) }()
-		_ = protocol.Pipe(workConn, conn)
-		return
-	}
-
-	nextHop := body.NextHops[0]
-	remaining := body.NextHops[1:]
-
-	m.mu.RLock()
-	addr, ok := m.peerAddresses[nextHop]
-	m.mu.RUnlock()
-	if !ok {
-		log.Printf("[mesh-%s] relay %s: unknown next hop %s", m.nodeID, body.RelayID, nextHop)
-		_ = conn.Close()
-		return
-	}
-
-	nextConn, err := m.dialer.Dial(addr)
-	if err != nil {
-		log.Printf("[mesh-%s] relay %s: dial %s failed: %v", m.nodeID, body.RelayID, nextHop, err)
-		_ = conn.Close()
-		return
-	}
-
-	err = protocol.WriteMsg(nextConn, protocol.MsgRelayOpen, &protocol.RelayOpenBody{
-		RelayID:  body.RelayID,
-		Hostname: body.Hostname,
-		NextHops: remaining,
-	})
-	if err != nil {
-		_ = conn.Close()
-		_ = nextConn.Close()
-		return
-	}
-
-	go func() { _ = protocol.Pipe(conn, nextConn) }()
-	_ = protocol.Pipe(nextConn, conn)
-}
-
-func (m *MeshManager) HasPeers() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.peers) > 0
-}
-
-func (m *MeshManager) markSeenLocked(msgID string) {
-	now := time.Now()
-	if len(m.seenMessages) > 1000 {
-		cutoff := now.Add(-30 * time.Second)
-		for k, v := range m.seenMessages {
-			if v.Before(cutoff) {
-				delete(m.seenMessages, k)
-			}
-		}
-	}
-	m.seenMessages[msgID] = now
+func (m *Mesh) LocalAddr() string {
+	node := m.list.LocalNode()
+	return fmt.Sprintf("%s:%d", node.Addr, node.Port)
 }

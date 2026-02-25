@@ -1,142 +1,211 @@
 package client
 
 import (
+	"bufio"
 	"context"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/cagojeiger/drp/internal/protocol"
-	"github.com/cagojeiger/drp/internal/transport"
+	drppb "github.com/cagojeiger/drp/proto/drp"
 )
 
-type pipeDialer struct {
-	conns chan net.Conn
+type chanDialer struct {
+	ch chan net.Conn
 }
 
-func (d *pipeDialer) Dial(string) (net.Conn, error) {
-	return <-d.conns, nil
+func (d *chanDialer) Dial(addr string) (net.Conn, error) {
+	return <-d.ch, nil
 }
 
-func newPipeDialer(conns ...net.Conn) transport.Dialer {
-	ch := make(chan net.Conn, len(conns))
-	for _, c := range conns {
-		ch <- c
-	}
-	return &pipeDialer{conns: ch}
-}
-
-func TestRun_LoginSuccess(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-
-	c := New(Config{
-		ServerAddr: "fake:9000",
+func baseConfig(localAddr string) Config {
+	return Config{
+		ServerAddr: "drps.example.com:9000",
 		Alias:      "myapp",
 		Hostname:   "myapp.example.com",
-		LocalAddr:  "fake:5000",
-	}, newPipeDialer(clientConn))
+		ProxyType:  "http",
+		LocalAddr:  localAddr,
+		APIKey:     "test-key",
+		Version:    "1.2.3",
+	}
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func startEchoServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4096)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					_, _ = c.Write(buf[:n])
+				}
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func readExactly(r *bufio.Reader, n int) []byte {
+	out := make([]byte, n)
+	read := 0
+	for read < n {
+		m, err := r.Read(out[read:])
+		if err != nil {
+			return nil
+		}
+		read += m
+	}
+	return out
+}
+
+func TestClientLoginSuccess(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer serverSide.Close()
+
+	dialer := &chanDialer{ch: make(chan net.Conn, 1)}
+	dialer.ch <- clientSide
+
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() {
-		_ = serverConn.SetDeadline(time.Now().Add(5 * time.Second))
+	c := New(baseConfig("127.0.0.1:9"), dialer)
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.Run(ctx) }()
 
-		msgType, _, err := protocol.ReadMsg(serverConn)
-		if err != nil {
-			t.Errorf("read login: %v", err)
-			return
-		}
-		if msgType != protocol.MsgLogin {
-			t.Errorf("expected Login, got 0x%02x", msgType)
-			return
-		}
-
-		_ = protocol.WriteMsg(serverConn, protocol.MsgLoginResp, &protocol.LoginRespBody{OK: true, Message: "ok"})
-
-		msgType, _, err = protocol.ReadMsg(serverConn)
-		if err != nil {
-			t.Errorf("read new proxy: %v", err)
-			return
-		}
-		if msgType != protocol.MsgNewProxy {
-			t.Errorf("expected NewProxy, got 0x%02x", msgType)
-			return
-		}
-
-		_ = protocol.WriteMsg(serverConn, protocol.MsgNewProxyResp, &protocol.NewProxyRespBody{OK: true, Message: "ok"})
-
-		<-ctx.Done()
-	}()
-
-	go c.Run(ctx)
+	r := bufio.NewReader(serverSide)
+	env, _ := protocol.ReadEnvelope(r)
+	if got := env.GetLogin(); got == nil || got.ApiKey != "test-key" || got.Version != "1.2.3" {
+		t.Fatalf("unexpected login: %+v", got)
+	}
+	_ = protocol.WriteEnvelope(serverSide, &drppb.Envelope{Payload: &drppb.Envelope_LoginResp{LoginResp: &drppb.LoginResp{Ok: true}}})
+	env, _ = protocol.ReadEnvelope(r)
+	if got := env.GetNewProxy(); got == nil || got.Alias != "myapp" || got.Hostname != "myapp.example.com" || got.Type != "http" {
+		t.Fatalf("unexpected new proxy: %+v", got)
+	}
+	_ = protocol.WriteEnvelope(serverSide, &drppb.Envelope{Payload: &drppb.Envelope_NewProxyResp{NewProxyResp: &drppb.NewProxyResp{Ok: true}}})
 
 	select {
 	case <-c.Ready():
-	case <-time.After(3 * time.Second):
-		t.Fatal("client did not become ready")
+	case <-time.After(2 * time.Second):
+		t.Fatal("client never became ready")
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return")
 	}
 }
 
-func TestRun_LoginRejected(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
+func TestClientLoginFailure(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer serverSide.Close()
 
-	c := New(Config{
-		ServerAddr: "fake:9000",
-		Alias:      "myapp",
-		Hostname:   "myapp.example.com",
-		LocalAddr:  "fake:5000",
-	}, newPipeDialer(clientConn))
+	dialer := &chanDialer{ch: make(chan net.Conn, 1)}
+	dialer.ch <- clientSide
 
-	go func() {
-		_ = serverConn.SetDeadline(time.Now().Add(5 * time.Second))
-		_, _, _ = protocol.ReadMsg(serverConn)
-		_ = protocol.WriteMsg(serverConn, protocol.MsgLoginResp, &protocol.LoginRespBody{OK: false, Message: "denied"})
-	}()
+	errCh := make(chan error, 1)
+	go func() { errCh <- New(baseConfig("127.0.0.1:9"), dialer).Run(context.Background()) }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	r := bufio.NewReader(serverSide)
+	_, _ = protocol.ReadEnvelope(r)
+	_ = protocol.WriteEnvelope(serverSide, &drppb.Envelope{Payload: &drppb.Envelope_LoginResp{LoginResp: &drppb.LoginResp{Ok: false, Error: "bad api key"}}})
 
-	err := c.Run(ctx)
-	if err == nil {
-		t.Fatal("expected login error, got nil")
-	}
-	if err.Error() != "login failed: denied" {
-		t.Fatalf("unexpected error: %v", err)
+	if err := <-errCh; err == nil || err.Error() != "login failed: bad api key" {
+		t.Fatalf("Run() error = %v", err)
 	}
 }
 
-func TestRun_ProxyRejected(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
+func TestClientProxyRegFailure(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer serverSide.Close()
 
-	c := New(Config{
-		ServerAddr: "fake:9000",
-		Alias:      "myapp",
-		Hostname:   "myapp.example.com",
-		LocalAddr:  "fake:5000",
-	}, newPipeDialer(clientConn))
+	dialer := &chanDialer{ch: make(chan net.Conn, 1)}
+	dialer.ch <- clientSide
 
-	go func() {
-		_ = serverConn.SetDeadline(time.Now().Add(5 * time.Second))
+	errCh := make(chan error, 1)
+	go func() { errCh <- New(baseConfig("127.0.0.1:9"), dialer).Run(context.Background()) }()
 
-		_, _, _ = protocol.ReadMsg(serverConn)
-		_ = protocol.WriteMsg(serverConn, protocol.MsgLoginResp, &protocol.LoginRespBody{OK: true, Message: "ok"})
+	r := bufio.NewReader(serverSide)
+	_, _ = protocol.ReadEnvelope(r)
+	_ = protocol.WriteEnvelope(serverSide, &drppb.Envelope{Payload: &drppb.Envelope_LoginResp{LoginResp: &drppb.LoginResp{Ok: true}}})
+	_, _ = protocol.ReadEnvelope(r)
+	_ = protocol.WriteEnvelope(serverSide, &drppb.Envelope{Payload: &drppb.Envelope_NewProxyResp{NewProxyResp: &drppb.NewProxyResp{Ok: false, Error: "hostname taken"}}})
 
-		_, _, _ = protocol.ReadMsg(serverConn)
-		_ = protocol.WriteMsg(serverConn, protocol.MsgNewProxyResp, &protocol.NewProxyRespBody{OK: false, Message: "duplicate"})
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	err := c.Run(ctx)
-	if err == nil {
-		t.Fatal("expected proxy error, got nil")
+	if err := <-errCh; err == nil || err.Error() != "new proxy failed: hostname taken" {
+		t.Fatalf("Run() error = %v", err)
 	}
-	if err.Error() != "proxy registration failed: duplicate" {
-		t.Fatalf("unexpected error: %v", err)
+}
+
+func TestClientWorkConn(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	controlClient, controlServer := net.Pipe()
+	defer controlServer.Close()
+	workClient, workServer := net.Pipe()
+	defer workServer.Close()
+
+	dialer := &chanDialer{ch: make(chan net.Conn, 2)}
+	dialer.ch <- controlClient
+	dialer.ch <- workClient
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := New(baseConfig(echoAddr), dialer)
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.Run(ctx) }()
+
+	controlR := bufio.NewReader(controlServer)
+	_, _ = protocol.ReadEnvelope(controlR)
+	_ = protocol.WriteEnvelope(controlServer, &drppb.Envelope{Payload: &drppb.Envelope_LoginResp{LoginResp: &drppb.LoginResp{Ok: true}}})
+	_, _ = protocol.ReadEnvelope(controlR)
+	_ = protocol.WriteEnvelope(controlServer, &drppb.Envelope{Payload: &drppb.Envelope_NewProxyResp{NewProxyResp: &drppb.NewProxyResp{Ok: true}}})
+
+	select {
+	case <-c.Ready():
+	case <-time.After(2 * time.Second):
+		t.Fatal("client never became ready")
+	}
+
+	_ = protocol.WriteEnvelope(controlServer, &drppb.Envelope{Payload: &drppb.Envelope_ReqWorkConn{ReqWorkConn: &drppb.ReqWorkConn{ProxyAlias: "myapp"}}})
+
+	workR := bufio.NewReader(workServer)
+	env, _ := protocol.ReadEnvelope(workR)
+	if got := env.GetNewWorkConn(); got == nil || got.ProxyAlias != "myapp" {
+		t.Fatalf("unexpected new_work_conn: %+v", got)
+	}
+	_ = protocol.WriteEnvelope(workServer, &drppb.Envelope{Payload: &drppb.Envelope_StartWorkConn{StartWorkConn: &drppb.StartWorkConn{ProxyAlias: "myapp"}}})
+
+	_, _ = workServer.Write([]byte("hello"))
+	if got := string(readExactly(workR, 5)); got != "hello" {
+		t.Fatalf("unexpected echoed payload: got %q want %q", got, "hello")
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return")
 	}
 }

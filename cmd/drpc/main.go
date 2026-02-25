@@ -8,44 +8,48 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"syscall"
 
 	"github.com/cagojeiger/drp/internal/client"
 	"github.com/cagojeiger/drp/internal/transport"
 )
 
 func main() {
-	serverAddr := flag.String("server", "", "drps server address (host:port)")
+	server := flag.String("server", "", "drps control address (host:port)")
 	alias := flag.String("alias", "", "service alias")
-	hostname := flag.String("hostname", "", "public hostname for routing")
+	hostname := flag.String("hostname", "", "public hostname")
+	proxyType := flag.String("type", "http", "proxy type: http or https")
 	local := flag.String("local", "", "local service address (host:port)")
-	verbose := flag.Bool("v", false, "verbose logging")
-	help := flag.Bool("help", false, "show help")
+	apiKey := flag.String("api-key", "", "API key for authentication")
 
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: drpc [options]\n\nOptions:\n")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
-	if *help {
+	if *server == "" || *alias == "" || *hostname == "" || *local == "" {
 		flag.Usage()
-		os.Exit(0)
-	}
-
-	if *serverAddr == "" || *alias == "" || *hostname == "" || *local == "" {
-		fmt.Fprintln(os.Stderr, "error: --server, --alias, --hostname, --local are all required")
 		os.Exit(1)
 	}
 
-	c := client.New(client.Config{
-		ServerAddr: *serverAddr,
+	cfg := client.Config{
+		ServerAddr: *server,
 		Alias:      *alias,
 		Hostname:   *hostname,
+		ProxyType:  *proxyType,
 		LocalAddr:  *local,
-		Verbose:    *verbose,
-	}, transport.TCP{})
+		APIKey:     *apiKey,
+	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
-	if err := c.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		cancel()
+	c := client.New(cfg, transport.TCPDialer{})
+	if err := c.Run(ctx); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		log.Fatal(err)
 	}
-	cancel()
 }
