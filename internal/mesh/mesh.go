@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/hashicorp/memberlist"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/cagojeiger/drp/internal/registry"
 	drppb "github.com/cagojeiger/drp/proto/drp"
@@ -29,6 +28,9 @@ type Mesh struct {
 	updateMu  sync.Mutex
 	leaveOnce sync.Once
 	leaveErr  error
+
+	metaMu   sync.RWMutex
+	nodeMeta map[string][]string
 }
 
 const removeBroadcastAttempts = 5
@@ -39,11 +41,14 @@ func New(cfg MeshConfig, reg *registry.Registry) *Mesh {
 		cfg.BindAddr = "0.0.0.0"
 	}
 
-	return &Mesh{
+	m := &Mesh{
 		config:   cfg,
 		delegate: delegate,
 		registry: reg,
+		nodeMeta: make(map[string][]string),
 	}
+	delegate.mesh = m
+	return m
 }
 
 func (m *Mesh) Create() error {
@@ -72,6 +77,18 @@ func (m *Mesh) Create() error {
 
 func (m *Mesh) Join(peers []string) (int, error) {
 	return m.list.Join(peers)
+}
+
+func (m *Mesh) UpdateNodeMeta(nodeID string, hostnames []string) {
+	m.metaMu.Lock()
+	m.nodeMeta[nodeID] = hostnames
+	m.metaMu.Unlock()
+}
+
+func (m *Mesh) RemoveNodeMeta(nodeID string) {
+	m.metaMu.Lock()
+	delete(m.nodeMeta, nodeID)
+	m.metaMu.Unlock()
 }
 
 func (m *Mesh) Leave(timeout time.Duration) error {
@@ -146,15 +163,14 @@ func (m *Mesh) Lookup(hostname string) (registry.ServiceInfo, bool) {
 			continue
 		}
 
-		meta := make([]byte, len(member.Meta))
-		copy(meta, member.Meta)
-		var ns drppb.NodeServices
-		if err := proto.Unmarshal(meta, &ns); err != nil {
-			m.registry.Unregister(hostname)
-			return registry.ServiceInfo{}, false
+		m.metaMu.RLock()
+		ns, ok := m.nodeMeta[member.Name]
+		m.metaMu.RUnlock()
+		if !ok {
+			return info, true
 		}
 
-		for _, h := range ns.Hostnames {
+		for _, h := range ns {
 			if h == hostname {
 				return info, true
 			}

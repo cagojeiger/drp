@@ -23,6 +23,15 @@ import (
 	"github.com/cagojeiger/drp/internal/transport"
 )
 
+// Authenticator decides whether a Login request is accepted.
+// Return ok=true to allow, or ok=false with a reason string to reject.
+// nil means allow all.
+type Authenticator func(login *drppb.Login) (ok bool, reason string)
+
+// ProxyAuthorizer decides whether a NewProxy request is accepted.
+// nil means allow all.
+type ProxyAuthorizer func(proxy *drppb.NewProxy) (ok bool, reason string)
+
 // ServerConfig holds all server startup parameters.
 type ServerConfig struct {
 	NodeID       string
@@ -33,6 +42,9 @@ type ServerConfig struct {
 	MeshBindAddr string // default "0.0.0.0"
 	MeshBindPort int    // default 7946, use 0 in tests
 	JoinPeers    []string
+
+	Authenticate   Authenticator
+	AuthorizeProxy ProxyAuthorizer
 }
 
 // ServerAddrs holds the resolved listen addresses after startup.
@@ -386,15 +398,21 @@ func (s *Server) handleControl(conn net.Conn) {
 }
 
 func (s *Server) clientSession(conn net.Conn, r *bufio.Reader, login *drppb.Login) {
-	// Accept all logins for now.
+	loginOk, loginErr := true, ""
+	if s.cfg.Authenticate != nil {
+		loginOk, loginErr = s.cfg.Authenticate(login)
+	}
 	if err := protocol.WriteEnvelope(conn, &drppb.Envelope{
-		Payload: &drppb.Envelope_LoginResp{LoginResp: &drppb.LoginResp{Ok: true}},
+		Payload: &drppb.Envelope_LoginResp{LoginResp: &drppb.LoginResp{Ok: loginOk, Error: loginErr}},
 	}); err != nil {
 		_ = conn.Close()
 		return
 	}
+	if !loginOk {
+		_ = conn.Close()
+		return
+	}
 
-	// Read NewProxy.
 	env, err := protocol.ReadEnvelope(r)
 	if err != nil {
 		_ = conn.Close()
@@ -406,7 +424,18 @@ func (s *Server) clientSession(conn net.Conn, r *bufio.Reader, login *drppb.Logi
 		return
 	}
 
-	// Track the service.
+	proxyOk, proxyErr := true, ""
+	if s.cfg.AuthorizeProxy != nil {
+		proxyOk, proxyErr = s.cfg.AuthorizeProxy(proxy)
+	}
+	if !proxyOk {
+		_ = protocol.WriteEnvelope(conn, &drppb.Envelope{
+			Payload: &drppb.Envelope_NewProxyResp{NewProxyResp: &drppb.NewProxyResp{Ok: false, Error: proxyErr}},
+		})
+		_ = conn.Close()
+		return
+	}
+
 	entry := &serviceEntry{
 		alias:     proxy.Alias,
 		hostname:  proxy.Hostname,

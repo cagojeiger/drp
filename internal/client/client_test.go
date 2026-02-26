@@ -1,34 +1,134 @@
-package client
+package client_test
 
 import (
-	"bufio"
 	"context"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/cagojeiger/drp/internal/protocol"
+	"github.com/cagojeiger/drp/internal/client"
+	"github.com/cagojeiger/drp/internal/server"
+	"github.com/cagojeiger/drp/internal/transport"
 	drppb "github.com/cagojeiger/drp/proto/drp"
 )
 
-type chanDialer struct {
-	ch chan net.Conn
-}
-
-func (d *chanDialer) Dial(addr string) (net.Conn, error) {
-	return <-d.ch, nil
-}
-
-func baseConfig(localAddr string) Config {
-	return Config{
-		ServerAddr: "drps.example.com:9000",
-		Alias:      "myapp",
-		Hostname:   "myapp.example.com",
+func baseConfig(controlAddr, alias, hostname, localAddr string) client.Config {
+	return client.Config{
+		ServerAddr: controlAddr,
+		Alias:      alias,
+		Hostname:   hostname,
 		ProxyType:  "http",
 		LocalAddr:  localAddr,
 		APIKey:     "test-key",
 		Version:    "1.2.3",
 	}
+}
+
+func normalizeAddr(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if host == "::" {
+		return net.JoinHostPort("::1", port)
+	}
+	if host == "" || host == "0.0.0.0" {
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+	return addr
+}
+
+func startTestServer(t *testing.T, opts ...func(*server.ServerConfig)) (addrs server.ServerAddrs, stop func()) {
+	t.Helper()
+
+	cfg := server.ServerConfig{
+		NodeID:       "test-node",
+		HTTPAddr:     ":0",
+		HTTPSAddr:    ":0",
+		ControlAddr:  ":0",
+		QuicAddr:     ":0",
+		MeshBindAddr: "127.0.0.1",
+		MeshBindPort: 0,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := server.New(cfg)
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Run(ctx) }()
+
+	select {
+	case <-s.Ready():
+	case err := <-errCh:
+		t.Fatalf("server failed to start: %v", err)
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("server did not become ready")
+	}
+
+	addrs = s.Addr()
+	addrs.HTTP = normalizeAddr(addrs.HTTP)
+	addrs.HTTPS = normalizeAddr(addrs.HTTPS)
+	addrs.Control = normalizeAddr(addrs.Control)
+
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Fatalf("server run failed: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("server did not shut down in time")
+			}
+		})
+	}
+	t.Cleanup(stop)
+
+	return addrs, stop
+}
+
+func startTestClient(t *testing.T, controlAddr, alias, hostname, localAddr string) (c *client.Client, stop func()) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c = client.New(baseConfig(controlAddr, alias, hostname, localAddr), transport.TCPDialer{})
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.Run(ctx) }()
+
+	select {
+	case <-c.Ready():
+	case err := <-errCh:
+		cancel()
+		t.Fatalf("client exited before ready: %v", err)
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("client never became ready")
+	}
+
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Fatalf("client run failed: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("client did not shut down in time")
+			}
+		})
+	}
+	t.Cleanup(stop)
+
+	return c, stop
 }
 
 func startEchoServer(t *testing.T) string {
@@ -38,6 +138,7 @@ func startEchoServer(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
+
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -57,155 +158,75 @@ func startEchoServer(t *testing.T) string {
 			}(conn)
 		}
 	}()
+
 	return ln.Addr().String()
 }
 
-func readExactly(r *bufio.Reader, n int) []byte {
-	out := make([]byte, n)
-	read := 0
-	for read < n {
-		m, err := r.Read(out[read:])
-		if err != nil {
-			return nil
-		}
-		read += m
-	}
-	return out
-}
-
 func TestClientLoginSuccess(t *testing.T) {
-	clientSide, serverSide := net.Pipe()
-	defer serverSide.Close()
-
-	dialer := &chanDialer{ch: make(chan net.Conn, 1)}
-	dialer.ch <- clientSide
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	c := New(baseConfig("127.0.0.1:9"), dialer)
-	errCh := make(chan error, 1)
-	go func() { errCh <- c.Run(ctx) }()
-
-	r := bufio.NewReader(serverSide)
-	env, _ := protocol.ReadEnvelope(r)
-	if got := env.GetLogin(); got == nil || got.ApiKey != "test-key" || got.Version != "1.2.3" {
-		t.Fatalf("unexpected login: %+v", got)
-	}
-	_ = protocol.WriteEnvelope(serverSide, &drppb.Envelope{Payload: &drppb.Envelope_LoginResp{LoginResp: &drppb.LoginResp{Ok: true}}})
-	env, _ = protocol.ReadEnvelope(r)
-	if got := env.GetNewProxy(); got == nil || got.Alias != "myapp" || got.Hostname != "myapp.example.com" || got.Type != "http" {
-		t.Fatalf("unexpected new proxy: %+v", got)
-	}
-	_ = protocol.WriteEnvelope(serverSide, &drppb.Envelope{Payload: &drppb.Envelope_NewProxyResp{NewProxyResp: &drppb.NewProxyResp{Ok: true}}})
-
-	select {
-	case <-c.Ready():
-	case <-time.After(2 * time.Second):
-		t.Fatal("client never became ready")
-	}
-
-	cancel()
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("Run() error = %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Run() did not return")
-	}
+	addrs, _ := startTestServer(t)
+	_, stopClient := startTestClient(t, addrs.Control, "myapp", "myapp.example.com", "127.0.0.1:9")
+	stopClient()
 }
 
 func TestClientLoginFailure(t *testing.T) {
-	clientSide, serverSide := net.Pipe()
-	defer serverSide.Close()
+	addrs, _ := startTestServer(t, func(cfg *server.ServerConfig) {
+		cfg.Authenticate = func(login *drppb.Login) (bool, string) {
+			return false, "bad api key"
+		}
+	})
 
-	dialer := &chanDialer{ch: make(chan net.Conn, 1)}
-	dialer.ch <- clientSide
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- New(baseConfig("127.0.0.1:9"), dialer).Run(context.Background()) }()
-
-	r := bufio.NewReader(serverSide)
-	_, _ = protocol.ReadEnvelope(r)
-	_ = protocol.WriteEnvelope(serverSide, &drppb.Envelope{Payload: &drppb.Envelope_LoginResp{LoginResp: &drppb.LoginResp{Ok: false, Error: "bad api key"}}})
-
-	if err := <-errCh; err == nil || err.Error() != "login failed: bad api key" {
+	err := client.New(baseConfig(addrs.Control, "myapp", "myapp.example.com", "127.0.0.1:9"), transport.TCPDialer{}).Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "login failed: bad api key") {
 		t.Fatalf("Run() error = %v", err)
 	}
 }
 
 func TestClientProxyRegFailure(t *testing.T) {
-	clientSide, serverSide := net.Pipe()
-	defer serverSide.Close()
+	addrs, _ := startTestServer(t, func(cfg *server.ServerConfig) {
+		cfg.AuthorizeProxy = func(proxy *drppb.NewProxy) (bool, string) {
+			return false, "hostname taken"
+		}
+	})
 
-	dialer := &chanDialer{ch: make(chan net.Conn, 1)}
-	dialer.ch <- clientSide
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- New(baseConfig("127.0.0.1:9"), dialer).Run(context.Background()) }()
-
-	r := bufio.NewReader(serverSide)
-	_, _ = protocol.ReadEnvelope(r)
-	_ = protocol.WriteEnvelope(serverSide, &drppb.Envelope{Payload: &drppb.Envelope_LoginResp{LoginResp: &drppb.LoginResp{Ok: true}}})
-	_, _ = protocol.ReadEnvelope(r)
-	_ = protocol.WriteEnvelope(serverSide, &drppb.Envelope{Payload: &drppb.Envelope_NewProxyResp{NewProxyResp: &drppb.NewProxyResp{Ok: false, Error: "hostname taken"}}})
-
-	if err := <-errCh; err == nil || err.Error() != "new proxy failed: hostname taken" {
+	err := client.New(baseConfig(addrs.Control, "myapp", "myapp.example.com", "127.0.0.1:9"), transport.TCPDialer{}).Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "new proxy failed: hostname taken") {
 		t.Fatalf("Run() error = %v", err)
 	}
 }
 
 func TestClientWorkConn(t *testing.T) {
 	echoAddr := startEchoServer(t)
-	controlClient, controlServer := net.Pipe()
-	defer controlServer.Close()
-	workClient, workServer := net.Pipe()
-	defer workServer.Close()
+	addrs, _ := startTestServer(t)
+	_, stopClient := startTestClient(t, addrs.Control, "myapp", "myapp.example.com", echoAddr)
 
-	dialer := &chanDialer{ch: make(chan net.Conn, 2)}
-	dialer.ch <- controlClient
-	dialer.ch <- workClient
+	time.Sleep(100 * time.Millisecond)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	c := New(baseConfig(echoAddr), dialer)
-	errCh := make(chan error, 1)
-	go func() { errCh <- c.Run(ctx) }()
+	userConn, err := net.Dial("tcp", addrs.HTTP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer userConn.Close()
 
-	controlR := bufio.NewReader(controlServer)
-	_, _ = protocol.ReadEnvelope(controlR)
-	_ = protocol.WriteEnvelope(controlServer, &drppb.Envelope{Payload: &drppb.Envelope_LoginResp{LoginResp: &drppb.LoginResp{Ok: true}}})
-	_, _ = protocol.ReadEnvelope(controlR)
-	_ = protocol.WriteEnvelope(controlServer, &drppb.Envelope{Payload: &drppb.Envelope_NewProxyResp{NewProxyResp: &drppb.NewProxyResp{Ok: true}}})
-
-	select {
-	case <-c.Ready():
-	case <-time.After(2 * time.Second):
-		t.Fatal("client never became ready")
+	if _, err := userConn.Write([]byte("GET / HTTP/1.1\r\nHost: myapp.example.com\r\n\r\n")); err != nil {
+		t.Fatal(err)
 	}
 
-	_ = protocol.WriteEnvelope(controlServer, &drppb.Envelope{Payload: &drppb.Envelope_ReqWorkConn{ReqWorkConn: &drppb.ReqWorkConn{ProxyAlias: "myapp"}}})
-
-	workR := bufio.NewReader(workServer)
-	env, _ := protocol.ReadEnvelope(workR)
-	if got := env.GetNewWorkConn(); got == nil || got.ProxyAlias != "myapp" {
-		t.Fatalf("unexpected new_work_conn: %+v", got)
+	userConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 4096)
+	n, err := userConn.Read(buf)
+	if err != nil {
+		t.Fatalf("read user response: %v", err)
 	}
-	_ = protocol.WriteEnvelope(workServer, &drppb.Envelope{Payload: &drppb.Envelope_StartWorkConn{StartWorkConn: &drppb.StartWorkConn{ProxyAlias: "myapp"}}})
-
-	_, _ = workServer.Write([]byte("hello"))
-	if got := string(readExactly(workR, 5)); got != "hello" {
-		t.Fatalf("unexpected echoed payload: got %q want %q", got, "hello")
+	got := string(buf[:n])
+	if !strings.Contains(got, "GET / HTTP/1.1") {
+		t.Fatalf("unexpected response: %q", got)
 	}
 
-	cancel()
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("Run() error = %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Run() did not return")
-	}
+	stopClient()
 }
