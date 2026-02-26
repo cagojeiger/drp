@@ -24,7 +24,7 @@ func createMesh(t *testing.T, nodeID string) (*Mesh, *registry.Registry) {
 	return m, reg
 }
 
-func waitForCondition(t *testing.T, timeout time.Duration, interval time.Duration, condition func() bool, msg string) {
+func waitForCondition(t *testing.T, timeout, interval time.Duration, condition func() bool, msg string) {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)

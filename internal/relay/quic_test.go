@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func setupRelayPair(t *testing.T) (server *RelayManager, client *RelayManager, serverAddr string) {
+func setupRelayPair(t *testing.T) (server, client *RelayManager, serverAddr string) {
 	t.Helper()
 
 	cert, err := GenerateSelfSignedCert()
@@ -169,7 +169,7 @@ func TestQuicStreamToNetConnInterface(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	var iface net.Conn = conn
+	iface := net.Conn(conn)
 	if iface == nil {
 		t.Fatal("net.Conn interface is nil")
 	}

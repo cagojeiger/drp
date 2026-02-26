@@ -51,7 +51,8 @@ func startServer(t *testing.T, cfg server.ServerConfig) (*server.Server, server.
 		}
 	})
 
-	return s, s.Addr(), cancel
+	addrs := s.Addr()
+	return s, addrs, cancel
 }
 
 func startEchoServer(t *testing.T) string {

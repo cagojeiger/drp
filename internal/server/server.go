@@ -158,11 +158,11 @@ func (s *Server) Run(ctx context.Context) error {
 	<-ctx.Done()
 
 	// 9. Cleanup
-	s.mesh.Leave(3 * time.Second)
-	s.relay.Close()
-	s.httpLn.Close()
-	s.httpsLn.Close()
-	s.ctrlLn.Close()
+	_ = s.mesh.Leave(3 * time.Second)
+	_ = s.relay.Close()
+	_ = s.httpLn.Close()
+	_ = s.httpsLn.Close()
+	_ = s.ctrlLn.Close()
 	return nil
 }
 
@@ -218,7 +218,7 @@ func (s *Server) relayAcceptLoop(ctx context.Context) {
 // ---------- HTTP/HTTPS ----------
 
 func (s *Server) handleHTTP(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
@@ -229,7 +229,7 @@ func (s *Server) handleHTTP(conn net.Conn) {
 
 	hostname := protocol.ExtractHost(buf)
 	if hostname == "" {
-		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 15\r\n\r\n400 Bad Request"))
+		_, _ = conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 15\r\n\r\n400 Bad Request"))
 		return
 	}
 
@@ -237,7 +237,7 @@ func (s *Server) handleHTTP(conn net.Conn) {
 }
 
 func (s *Server) handleHTTPS(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
@@ -259,7 +259,7 @@ func (s *Server) handleHTTPS(conn net.Conn) {
 func (s *Server) routeRequest(hostname string, userConn net.Conn, buffered []byte) {
 	info, found := s.mesh.Lookup(hostname)
 	if !found {
-		userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+		_, _ = userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
 		return
 	}
 
@@ -275,7 +275,7 @@ func (s *Server) localRoute(info registry.ServiceInfo, userConn net.Conn, buf []
 	entry, ok := s.services[info.ProxyAlias]
 	s.mu.RUnlock()
 	if !ok {
-		userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+		_, _ = userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
 		return
 	}
 
@@ -286,7 +286,7 @@ func (s *Server) localRoute(info registry.ServiceInfo, userConn net.Conn, buf []
 		}},
 	}); err != nil {
 		log.Printf("req work conn write error: %v", err)
-		userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+		_, _ = userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
 		return
 	}
 
@@ -295,30 +295,30 @@ func (s *Server) localRoute(info registry.ServiceInfo, userConn net.Conn, buf []
 	select {
 	case workConn = <-entry.workQueue:
 	case <-time.After(10 * time.Second):
-		userConn.Write([]byte("HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 19\r\n\r\n504 Gateway Timeout"))
+		_, _ = userConn.Write([]byte("HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 19\r\n\r\n504 Gateway Timeout"))
 		return
 	}
-	defer workConn.Close()
+	defer func() { _ = workConn.Close() }()
 
 	// Tell the client which proxy this work connection is for.
-	protocol.WriteEnvelope(workConn, &drppb.Envelope{
+	_ = protocol.WriteEnvelope(workConn, &drppb.Envelope{
 		Payload: &drppb.Envelope_StartWorkConn{StartWorkConn: &drppb.StartWorkConn{
 			ProxyAlias: info.ProxyAlias,
 		}},
 	})
 
 	// Flush the buffered initial bytes.
-	workConn.Write(buf)
+	_, _ = workConn.Write(buf)
 
 	// Bidirectional pipe.
-	go protocol.Pipe(userConn, workConn)
-	protocol.Pipe(workConn, userConn)
+	go func() { _ = protocol.Pipe(userConn, workConn) }()
+	_ = protocol.Pipe(workConn, userConn)
 }
 
 func (s *Server) remoteRelay(info registry.ServiceInfo, userConn net.Conn, buf []byte) {
 	peerAddr := s.resolvePeerQuicAddr(info.NodeID)
 	if peerAddr == "" {
-		userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+		_, _ = userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
 		return
 	}
 
@@ -328,23 +328,23 @@ func (s *Server) remoteRelay(info registry.ServiceInfo, userConn net.Conn, buf [
 	stream, err := s.relay.DialStream(ctx, peerAddr)
 	if err != nil {
 		log.Printf("relay dial to %s (%s) failed: %v", info.NodeID, peerAddr, err)
-		userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+		_, _ = userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
 		return
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	// Send RelayOpen header so the receiving node knows which proxy to invoke.
-	protocol.WriteEnvelope(stream, &drppb.Envelope{
+	_ = protocol.WriteEnvelope(stream, &drppb.Envelope{
 		Payload: &drppb.Envelope_RelayOpen{RelayOpen: &drppb.RelayOpen{
 			ProxyAlias: info.ProxyAlias,
 			RequestId:  fmt.Sprintf("%d", time.Now().UnixNano()),
 		}},
 	})
 
-	stream.Write(buf)
+	_, _ = stream.Write(buf)
 
-	go protocol.Pipe(userConn, stream)
-	protocol.Pipe(stream, userConn)
+	go func() { _ = protocol.Pipe(userConn, stream) }()
+	_ = protocol.Pipe(stream, userConn)
 }
 
 func (s *Server) resolvePeerQuicAddr(nodeID string) string {
@@ -370,7 +370,7 @@ func (s *Server) handleControl(conn net.Conn) {
 	r := bufio.NewReader(conn)
 	env, err := protocol.ReadEnvelope(r)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
@@ -381,7 +381,7 @@ func (s *Server) handleControl(conn net.Conn) {
 		s.acceptWorkConn(conn, p.NewWorkConn)
 	default:
 		log.Printf("unexpected control message: %T", p)
-		conn.Close()
+		_ = conn.Close()
 	}
 }
 
@@ -390,19 +390,19 @@ func (s *Server) clientSession(conn net.Conn, r *bufio.Reader, login *drppb.Logi
 	if err := protocol.WriteEnvelope(conn, &drppb.Envelope{
 		Payload: &drppb.Envelope_LoginResp{LoginResp: &drppb.LoginResp{Ok: true}},
 	}); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
 	// Read NewProxy.
 	env, err := protocol.ReadEnvelope(r)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 	proxy := env.GetNewProxy()
 	if proxy == nil {
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
@@ -427,7 +427,7 @@ func (s *Server) clientSession(conn net.Conn, r *bufio.Reader, login *drppb.Logi
 		delete(s.services, proxy.Alias)
 		s.mu.Unlock()
 		s.mesh.UnregisterService(proxy.Hostname)
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
@@ -437,7 +437,7 @@ func (s *Server) clientSession(conn net.Conn, r *bufio.Reader, login *drppb.Logi
 		delete(s.services, proxy.Alias)
 		s.mu.Unlock()
 		s.mesh.UnregisterService(proxy.Hostname)
-		conn.Close()
+		_ = conn.Close()
 	}()
 
 	for {
@@ -447,7 +447,7 @@ func (s *Server) clientSession(conn net.Conn, r *bufio.Reader, login *drppb.Logi
 		}
 		switch env.Payload.(type) {
 		case *drppb.Envelope_Ping:
-			protocol.WriteEnvelope(conn, &drppb.Envelope{
+			_ = protocol.WriteEnvelope(conn, &drppb.Envelope{
 				Payload: &drppb.Envelope_Pong{Pong: &drppb.Pong{}},
 			})
 		default:
@@ -461,21 +461,21 @@ func (s *Server) acceptWorkConn(conn net.Conn, nwc *drppb.NewWorkConn) {
 	entry, ok := s.services[nwc.ProxyAlias]
 	s.mu.RUnlock()
 	if !ok {
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
 	select {
 	case entry.workQueue <- conn:
 	case <-time.After(10 * time.Second):
-		conn.Close()
+		_ = conn.Close()
 	}
 }
 
 // ---------- relay accept ----------
 
 func (s *Server) handleRelayConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	r := bufio.NewReader(conn)
 	env, err := protocol.ReadEnvelope(r)
@@ -511,14 +511,14 @@ func (s *Server) handleRelayConn(conn net.Conn) {
 	case <-time.After(10 * time.Second):
 		return
 	}
-	defer workConn.Close()
+	defer func() { _ = workConn.Close() }()
 
-	protocol.WriteEnvelope(workConn, &drppb.Envelope{
+	_ = protocol.WriteEnvelope(workConn, &drppb.Envelope{
 		Payload: &drppb.Envelope_StartWorkConn{StartWorkConn: &drppb.StartWorkConn{
 			ProxyAlias: ro.ProxyAlias,
 		}},
 	})
 
-	go protocol.Pipe(conn, workConn)
-	protocol.Pipe(workConn, r)
+	go func() { _ = protocol.Pipe(conn, workConn) }()
+	_ = protocol.Pipe(workConn, r)
 }

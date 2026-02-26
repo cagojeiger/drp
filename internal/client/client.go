@@ -44,7 +44,7 @@ func (c *Client) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("dial server: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := protocol.WriteEnvelope(conn, &drppb.Envelope{
 		Payload: &drppb.Envelope_Login{Login: &drppb.Login{
 			ApiKey:  c.cfg.APIKey,
@@ -146,7 +146,7 @@ func (c *Client) handleWorkConn(proxyAlias string) {
 		log.Printf("work conn dial failed: %v", err)
 		return
 	}
-	defer workConn.Close()
+	defer func() { _ = workConn.Close() }()
 	if err := protocol.WriteEnvelope(workConn, &drppb.Envelope{
 		Payload: &drppb.Envelope_NewWorkConn{NewWorkConn: &drppb.NewWorkConn{
 			ProxyAlias: proxyAlias,
@@ -171,7 +171,7 @@ func (c *Client) handleWorkConn(proxyAlias string) {
 		log.Printf("dial local service failed: %v", err)
 		return
 	}
-	defer localConn.Close()
+	defer func() { _ = localConn.Close() }()
 
 	go func() {
 		if err := protocol.Pipe(workConn, localConn); err != nil {

@@ -43,13 +43,11 @@ func main() {
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	c := client.New(cfg, transport.TCPDialer{})
-	if err := c.Run(ctx); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return
-		}
+	err := c.Run(ctx)
+	cancel()
+	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
 	}
 }

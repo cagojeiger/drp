@@ -76,7 +76,8 @@ func startServerHelper(t *testing.T, nodeID string, joinPeers []string) (*server
 		case <-time.After(5 * time.Second):
 		}
 	})
-	return s, s.Addr(), cancel
+	addrs := s.Addr()
+	return s, addrs, cancel
 }
 
 func startClientHelper(t *testing.T, controlAddr, alias, hostname, echoAddr string) (*client.Client, context.CancelFunc) {
