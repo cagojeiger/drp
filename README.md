@@ -23,43 +23,34 @@ Internet User                          Behind NAT
 ## Key Features
 
 - **HTTP/HTTPS only** — Routes by `Host` header (:80) and TLS SNI (:443). Covers HTTP, WebSocket, gRPC, h2, and all TLS-based protocols.
-- **Zero external dependencies** — No Redis, no etcd. Servers form a mesh and discover services via broadcast.
-- **Distributed** — Multiple drps servers behind a load balancer. Servers communicate via mesh, no shared state needed.
-- **Minimal** — Small codebase. No plugins, no dashboards, no complex config files.
-- **Infrastructure neutral** — Works with any LB, any environment (K8s, Docker, bare metal).
-- **Technology agnostic** — Architecture is not tied to any specific language or library.
+- **No infrastructure dependencies** — No Redis, no etcd, no Consul. Servers form a SWIM+Gossip mesh and discover services automatically.
+- **Distributed** — Multiple drps servers behind a load balancer. Service registry propagates via gossip protocol — no shared state needed.
+- **Minimal** — Small codebase, three external libraries. No plugins, no dashboards, no complex config files.
+- **Infrastructure neutral** — Works with any L4 LB, any environment (K8s, Docker, bare metal).
 - **TLS passthrough** — SNI routing on :443 without terminating TLS. End-to-end encryption preserved.
 
 ## How It Works
 
-1. **drpc** connects to **drps** via LB (single connection)
+1. **drpc** connects to **drps** via LB (TCP control connection)
 2. **drpc** registers a service: `alias=myapp, hostname=myapp.example.com`
-3. User visits `myapp.example.com` → LB → any drps
-4. If drps has the client locally → direct connection
-5. If not → **broadcast** "who has myapp?" → mesh peer responds → **relay** through mesh
+3. **drps** adds the service to its local registry and propagates via gossip to all mesh peers
+4. User visits `myapp.example.com` → LB → any drps node
+5. drps looks up hostname in local registry (O(1) lookup)
+6. If the service is **local** → direct work connection to the drpc client
+7. If the service is **remote** → QUIC relay stream to the node that owns it
 
-### Mesh + Broadcast + Relay
+### Gossip Propagation + Local Lookup + QUIC Relay
 
 ```
-drps-A ◄──── drpc (myapp)     drps-A has the client
+drps-A ◄──── drpc (myapp)       drps-A owns the service
   │
-  mesh                         User hits drps-B:
-  │                              1. drps-B broadcasts "who has myapp?"
-drps-B ◄──── user request       2. drps-A responds "I have it!"
-  │                              3. drps-B relays data through mesh
-  mesh
-  │                            Relay is intra-cluster: sub-ms latency
-drps-C
-```
-
-### HA (Optional)
-
-By default, drpc connects to 1 server. Mesh handles routing.
-
-Optionally, enable HA for fault tolerance:
-
-```bash
-drp client --server lb.example.com:9000 --ha-connections 2
+  gossip (SWIM protocol)         User hits drps-B:
+  │                                1. drps-B checks local registry → myapp is on drps-A
+drps-B ◄──── user request         2. drps-B opens QUIC stream to drps-A
+  │                                3. drps-A requests work conn from drpc
+  gossip                           4. traffic flows: user ↔ drps-B ↔ QUIC ↔ drps-A ↔ drpc ↔ localhost
+  │
+drps-C                           QUIC relay is intra-cluster: sub-ms latency
 ```
 
 ### Protocol Support
@@ -85,20 +76,73 @@ drp client --server lb.example.com:9000 --ha-connections 2
            drps-A  B   C     <-- mesh connected
               |  \/ |  |
               |  /\ |  |
-              mesh mesh mesh  <-- broadcast + relay
+              mesh mesh mesh  <-- gossip + QUIC relay
               |     |  |
            drpc-1  2   3     <-- behind NAT, each connects to 1 drps
               |     |  |
            local  local local
 ```
 
+### Ports
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| :80 | TCP | HTTP user traffic (Host header routing) |
+| :443 | TCP | HTTPS/TLS user traffic (SNI routing) |
+| :9000 | TCP | drpc control (Login, NewProxy, WorkConn) |
+| :9001 | QUIC/UDP | Server-to-server relay (multiplexed streams) |
+| :7946 | TCP+UDP | SWIM+Gossip membership (memberlist) |
+
 ### Components
 
 | Component | Role |
 |-----------|------|
-| **drps** (server) | Accepts user connections, routes by Host/SNI, mesh with peers |
+| **drps** (server) | Accepts user connections, routes by Host/SNI, gossip mesh with peers, QUIC relay |
 | **drpc** (client) | Connects to 1 drps via LB, provides work connections to local services |
 | **LB** | L4 load balancer (round-robin). No sticky sessions needed |
+
+### Tech Stack
+
+| Library | Purpose |
+|---------|---------|
+| [hashicorp/memberlist](https://github.com/hashicorp/memberlist) | SWIM+Gossip membership and service discovery |
+| [quic-go/quic-go](https://github.com/quic-go/quic-go) | QUIC transport for server-to-server relay |
+| [google/protobuf](https://pkg.go.dev/google.golang.org/protobuf) | Protocol Buffers for message serialization |
+
+No other external dependencies. No infrastructure services required.
+
+## Usage
+
+### Build
+
+```bash
+make build
+# produces: bin/drps, bin/drpc
+```
+
+### Server (drps)
+
+```bash
+drps \
+  --node-id node-1 \
+  --http :80 \
+  --https :443 \
+  --control :9000 \
+  --quic :9001 \
+  --mesh-port 7946 \
+  --join node-2:7946,node-3:7946
+```
+
+### Client (drpc)
+
+```bash
+drpc \
+  --server lb.example.com:9000 \
+  --alias myapp \
+  --hostname myapp.example.com \
+  --type http \
+  --local 127.0.0.1:3000
+```
 
 ## Comparison with frp
 
@@ -106,9 +150,12 @@ drp client --server lb.example.com:9000 --ha-connections 2
 |---|---|---|
 | Architecture | Single server | **Distributed (server mesh)** |
 | Routing | Port-based (port exhaustion) | **Host/SNI (2 ports for unlimited services)** |
-| External deps | None (but single server) | **None (and distributed)** |
-| Protocol | TCP/UDP/HTTP/KCP/QUIC/WS/... | **HTTP/HTTPS (web traffic only)** |
-| HA | None | **Mesh routing + optional multi-connect** |
+| Service discovery | N/A (single server) | **SWIM+Gossip (O(1) lookup, auto failure detection)** |
+| Server relay | N/A | **QUIC (multiplexed streams, no HoL blocking)** |
+| Serialization | Custom JSON | **Protocol Buffers (schema evolution, type safety)** |
+| External deps | None (but single server) | **No infra deps (3 Go libraries)** |
+| Protocol | TCP/UDP/HTTP/KCP/QUIC/WS/... | **HTTP/HTTPS only** |
+| HA | None | **Mesh routing (any node can serve any request)** |
 | Deployment | Single server only | **Any LB, any infra** |
 
 ## Design Decisions
@@ -117,11 +164,11 @@ See [docs/adr/](docs/adr/) for Architecture Decision Records:
 
 | ADR | Decision |
 |-----|----------|
-| [001](docs/adr/001-scope-and-philosophy.md) | HTTP/HTTPS only, zero external deps |
+| [001](docs/adr/001-scope-and-philosophy.md) | HTTP/HTTPS only, zero infra deps, proven tech |
 | [002](docs/adr/002-host-sni-routing.md) | Host header + TLS SNI routing |
-| [003](docs/adr/003-server-mesh-and-discovery.md) | Server mesh, broadcast discovery, relay |
-| [004](docs/adr/004-protocol-and-messages.md) | TLV + JSON protocol |
-| [005](docs/adr/005-mesh-transport-quic.md) | QUIC for mesh transport (multiplexing) |
+| [003](docs/adr/003-server-mesh-and-discovery.md) | SWIM+Gossip membership and service discovery |
+| [004](docs/adr/004-protocol-and-messages.md) | Protocol Buffers with protodelim framing |
+| [005](docs/adr/005-mesh-transport-quic.md) | QUIC for server-to-server relay |
 
 ## License
 
