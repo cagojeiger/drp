@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cagojeiger/drp/internal/registry"
@@ -69,3 +70,32 @@ func (f *fakeRegistrar) getUnregistered() []string {
 	copy(cp, f.unregistered)
 	return cp
 }
+
+// faultConn wraps a net.Conn and allows injecting read/write errors at test time.
+type faultConn struct {
+	net.Conn
+	readErr  atomic.Pointer[error]
+	writeErr atomic.Pointer[error]
+}
+
+func newFaultConn(c net.Conn) *faultConn {
+	return &faultConn{Conn: c}
+}
+
+func (c *faultConn) Read(b []byte) (int, error) {
+	if p := c.readErr.Load(); p != nil {
+		return 0, *p
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *faultConn) Write(b []byte) (int, error) {
+	if p := c.writeErr.Load(); p != nil {
+		return 0, *p
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *faultConn) InjectReadError(err error)  { c.readErr.Store(&err) }
+func (c *faultConn) InjectWriteError(err error) { c.writeErr.Store(&err) }
+func (c *faultConn) ClearFaults()               { c.readErr.Store(nil); c.writeErr.Store(nil) }

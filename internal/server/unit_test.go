@@ -1036,3 +1036,248 @@ func TestAcceptWorkConn_UnknownAlias(t *testing.T) {
 		t.Fatal("expected write to closed conn to fail")
 	}
 }
+
+func TestHandleControl_SessionEOFCleansUp(t *testing.T) {
+	t.Parallel()
+	registrar := &fakeRegistrar{}
+	s := &Server{
+		registrar: registrar,
+		services:  make(map[string]*serviceEntry),
+	}
+
+	serverConn, clientConn := net.Pipe()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.handleControl(serverConn)
+	}()
+
+	r := bufio.NewReader(clientConn)
+
+	_ = protocol.WriteEnvelope(clientConn, &drppb.Envelope{
+		Payload: &drppb.Envelope_Login{Login: &drppb.Login{ApiKey: "k"}},
+	})
+	env, _ := protocol.ReadEnvelope(r)
+	if !env.GetLoginResp().Ok {
+		t.Fatal("login should succeed")
+	}
+
+	_ = protocol.WriteEnvelope(clientConn, &drppb.Envelope{
+		Payload: &drppb.Envelope_NewProxy{NewProxy: &drppb.NewProxy{
+			Alias: "svc", Hostname: "svc.test", Type: "http",
+		}},
+	})
+	env, _ = protocol.ReadEnvelope(r)
+	if !env.GetNewProxyResp().Ok {
+		t.Fatal("proxy should succeed")
+	}
+
+	s.mu.RLock()
+	_, exists := s.services["svc"]
+	s.mu.RUnlock()
+	if !exists {
+		t.Fatal("service should exist before disconnect")
+	}
+
+	_ = clientConn.Close()
+
+	waitDone(t, done)
+
+	s.mu.RLock()
+	_, stillExists := s.services["svc"]
+	s.mu.RUnlock()
+	if stillExists {
+		t.Fatal("service should be removed after connection drop")
+	}
+
+	unreg := registrar.getUnregistered()
+	if len(unreg) != 1 || unreg[0] != "svc.test" {
+		t.Fatalf("expected unregister of svc.test, got %v", unreg)
+	}
+}
+
+func TestHandleControl_LoginWriteFailure(t *testing.T) {
+	t.Parallel()
+	s := &Server{
+		registrar: &fakeRegistrar{},
+		services:  make(map[string]*serviceEntry),
+	}
+
+	serverConn, clientConn := net.Pipe()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.handleControl(serverConn)
+	}()
+
+	_ = protocol.WriteEnvelope(clientConn, &drppb.Envelope{
+		Payload: &drppb.Envelope_Login{Login: &drppb.Login{ApiKey: "k"}},
+	})
+	_ = clientConn.Close()
+
+	waitDone(t, done)
+}
+
+func TestHandleControl_PongWriteFailure(t *testing.T) {
+	t.Parallel()
+	registrar := &fakeRegistrar{}
+	s := &Server{
+		registrar: registrar,
+		services:  make(map[string]*serviceEntry),
+	}
+
+	serverConn, clientConn := net.Pipe()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.handleControl(serverConn)
+	}()
+
+	r := bufio.NewReader(clientConn)
+	_ = protocol.WriteEnvelope(clientConn, &drppb.Envelope{
+		Payload: &drppb.Envelope_Login{Login: &drppb.Login{ApiKey: "k"}},
+	})
+	if env, err := protocol.ReadEnvelope(r); err != nil || !env.GetLoginResp().Ok {
+		t.Fatal("login should succeed")
+	}
+
+	_ = protocol.WriteEnvelope(clientConn, &drppb.Envelope{
+		Payload: &drppb.Envelope_NewProxy{NewProxy: &drppb.NewProxy{
+			Alias: "hb", Hostname: "hb.test", Type: "http",
+		}},
+	})
+	if env, err := protocol.ReadEnvelope(r); err != nil || !env.GetNewProxyResp().Ok {
+		t.Fatal("proxy should succeed")
+	}
+
+	_ = protocol.WriteEnvelope(clientConn, &drppb.Envelope{
+		Payload: &drppb.Envelope_Ping{Ping: &drppb.Ping{}},
+	})
+	_ = clientConn.Close()
+
+	waitDone(t, done)
+
+	unreg := registrar.getUnregistered()
+	if len(unreg) != 1 || unreg[0] != "hb.test" {
+		t.Fatalf("expected unregister of hb.test, got %v", unreg)
+	}
+}
+
+func TestLocalRoute_PipeMidStreamClose(t *testing.T) {
+	t.Parallel()
+	userServer, userClient := net.Pipe()
+	workServer, workClient := net.Pipe()
+
+	s := &Server{broker: &fakeBroker{conn: workServer}}
+	info := registry.ServiceInfo{ProxyAlias: "app"}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.localRoute(info, userServer, nil)
+	}()
+
+	workR := bufio.NewReader(workClient)
+	env := readEnvWithBuf(t, workR, workClient)
+	if env.GetStartWorkConn() == nil {
+		t.Fatal("expected StartWorkConn")
+	}
+
+	_ = userClient.Close()
+	_ = workClient.Close()
+	waitDone(t, done)
+}
+
+func TestRemoteRelay_PipeMidStreamClose(t *testing.T) {
+	t.Parallel()
+	userServer, userClient := net.Pipe()
+	streamServer, streamClient := net.Pipe()
+
+	s := &Server{relayer: &fakeRelayer{conn: streamServer}}
+	info := registry.ServiceInfo{ProxyAlias: "app", NodeID: "node-b", IsLocal: false}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.remoteRelay(info, userServer, nil)
+	}()
+
+	streamR := bufio.NewReader(streamClient)
+	env := readEnvWithBuf(t, streamR, streamClient)
+	if env.GetRelayOpen() == nil {
+		t.Fatal("expected RelayOpen")
+	}
+
+	_ = userClient.Close()
+	_ = streamClient.Close()
+	waitDone(t, done)
+}
+
+func TestRealBroker_ControlConnWriteError(t *testing.T) {
+	t.Parallel()
+	ctrlServer, ctrlClient := net.Pipe()
+
+	_ = ctrlClient.Close()
+
+	var mu sync.RWMutex
+	services := map[string]*serviceEntry{
+		"app": {
+			alias:     "app",
+			hostname:  "app.test",
+			ctrlConn:  ctrlServer,
+			workQueue: make(chan net.Conn, 10),
+		},
+	}
+
+	b := &realBroker{mu: &mu, services: services}
+	_, err := b.RequestAndWait("app", 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected error when control conn is closed")
+	}
+}
+
+func TestHandleControl_ReadErrorAfterProxy(t *testing.T) {
+	t.Parallel()
+	registrar := &fakeRegistrar{}
+	s := &Server{
+		registrar: registrar,
+		services:  make(map[string]*serviceEntry),
+	}
+
+	serverConn, clientConn := net.Pipe()
+	fc := newFaultConn(clientConn)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.handleControl(serverConn)
+	}()
+
+	r := bufio.NewReader(fc)
+
+	_ = protocol.WriteEnvelope(fc, &drppb.Envelope{
+		Payload: &drppb.Envelope_Login{Login: &drppb.Login{ApiKey: "k"}},
+	})
+	protocol.ReadEnvelope(r)
+
+	_ = protocol.WriteEnvelope(fc, &drppb.Envelope{
+		Payload: &drppb.Envelope_NewProxy{NewProxy: &drppb.NewProxy{
+			Alias: "myapp", Hostname: "myapp.test", Type: "http",
+		}},
+	})
+	protocol.ReadEnvelope(r)
+
+	fc.InjectReadError(errors.New("connection reset by peer"))
+
+	_ = fc.Close()
+
+	waitDone(t, done)
+
+	unreg := registrar.getUnregistered()
+	if len(unreg) != 1 || unreg[0] != "myapp.test" {
+		t.Fatalf("expected unregister of myapp.test, got %v", unreg)
+	}
+}
