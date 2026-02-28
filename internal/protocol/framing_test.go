@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	drppb "github.com/cagojeiger/drp/proto/drp"
 	"google.golang.org/protobuf/proto"
@@ -214,5 +215,107 @@ func TestPipe(t *testing.T) {
 	}
 	if err := <-errPipe; err != nil {
 		t.Fatalf("Pipe() error = %v", err)
+	}
+}
+
+func TestReadEnvelopeEOF(t *testing.T) {
+	left, right := net.Pipe()
+	_ = left.Close()
+
+	_, err := ReadEnvelope(bufio.NewReader(right))
+	if err == nil {
+		t.Fatal("expected error on EOF, got nil")
+	}
+	_ = right.Close()
+}
+
+func TestReadEnvelopeTruncated(t *testing.T) {
+	left, right := net.Pipe()
+
+	go func() {
+		_, _ = left.Write([]byte{100})
+		_ = left.Close()
+	}()
+
+	_, err := ReadEnvelope(bufio.NewReader(right))
+	if err == nil {
+		t.Fatal("expected error on truncated message, got nil")
+	}
+	_ = right.Close()
+}
+
+func TestReadEnvelopeCorruptData(t *testing.T) {
+	left, right := net.Pipe()
+
+	go func() {
+		_, _ = left.Write([]byte{5, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
+		_ = left.Close()
+	}()
+
+	_, err := ReadEnvelope(bufio.NewReader(right))
+	if err == nil {
+		t.Fatal("expected error on corrupt data, got nil")
+	}
+	_ = right.Close()
+}
+
+func TestPipeSrcClosesMidTransfer(t *testing.T) {
+	srcR, srcW := net.Pipe()
+	dstR, dstW := net.Pipe()
+	defer dstR.Close()
+	defer dstW.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Pipe(dstW, srcR)
+	}()
+
+	_, _ = srcW.Write([]byte("hello"))
+	_ = srcW.Close()
+
+	buf := make([]byte, 10)
+	dstR.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, _ := dstR.Read(buf)
+	if n == 0 {
+		t.Fatal("expected some data before source close")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil && err != io.EOF {
+			t.Logf("Pipe returned: %v (acceptable)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Pipe did not return after source close")
+	}
+
+	_ = srcR.Close()
+}
+
+func TestPipeDstClosesMidTransfer(t *testing.T) {
+	srcR, srcW := net.Pipe()
+	dstR, dstW := net.Pipe()
+	defer srcR.Close()
+	defer dstR.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Pipe(dstW, srcR)
+	}()
+
+	_ = dstW.Close()
+
+	go func() {
+		_, _ = srcW.Write([]byte("data-after-dst-close"))
+		_ = srcW.Close()
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected error when destination closes, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Pipe did not return after destination close")
 	}
 }
