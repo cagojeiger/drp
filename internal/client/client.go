@@ -14,19 +14,21 @@ import (
 )
 
 type Config struct {
-	ServerAddr string // drps control address (host:port)
-	Alias      string // service alias (e.g. "myapp")
-	Hostname   string // public hostname (e.g. "myapp.example.com")
-	ProxyType  string // "http" or "https", default "http"
-	LocalAddr  string // local service address (host:port)
-	APIKey     string // API key for authentication
-	Version    string // client version string
+	ServerAddr  string           // drps control address (host:port)
+	Alias       string           // service alias (e.g. "myapp")
+	Hostname    string           // public hostname (e.g. "myapp.example.com")
+	ProxyType   string           // "http" or "https", default "http"
+	LocalAddr   string           // local service address (host:port)
+	APIKey      string           // API key for authentication
+	Version     string           // client version string
+	LocalDialer transport.Dialer // optional, defaults to TCPDialer
 }
 
 type Client struct {
-	cfg    Config
-	dialer transport.Dialer
-	ready  chan struct{}
+	cfg         Config
+	dialer      transport.Dialer
+	localDialer transport.Dialer
+	ready       chan struct{}
 }
 
 func New(cfg Config, dialer transport.Dialer) *Client {
@@ -36,7 +38,11 @@ func New(cfg Config, dialer transport.Dialer) *Client {
 	if cfg.Version == "" {
 		cfg.Version = "0.1.0"
 	}
-	return &Client{cfg: cfg, dialer: dialer, ready: make(chan struct{})}
+	localDialer := cfg.LocalDialer
+	if localDialer == nil {
+		localDialer = transport.TCPDialer{}
+	}
+	return &Client{cfg: cfg, dialer: dialer, localDialer: localDialer, ready: make(chan struct{})}
 }
 
 func (c *Client) Run(ctx context.Context) error {
@@ -166,7 +172,7 @@ func (c *Client) handleWorkConn(proxyAlias string) {
 		log.Printf("unexpected work conn response: %T", env.Payload)
 		return
 	}
-	localConn, err := net.Dial("tcp", c.cfg.LocalAddr)
+	localConn, err := c.localDialer.Dial(c.cfg.LocalAddr)
 	if err != nil {
 		log.Printf("dial local service failed: %v", err)
 		return

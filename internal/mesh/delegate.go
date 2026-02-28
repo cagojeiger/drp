@@ -37,11 +37,7 @@ func (d *DrpDelegate) SetQuicAddr(addr string) {
 }
 
 func (d *DrpDelegate) NodeMeta(limit int) []byte {
-	services := d.registry.LocalServices()
-	hostnames := make([]string, 0, len(services))
-	for _, svc := range services {
-		hostnames = append(hostnames, svc.Hostname)
-	}
+	hostnames := buildHostnames(d.registry)
 
 	d.mu.RLock()
 	qa := d.quicAddr
@@ -78,11 +74,7 @@ func (d *DrpDelegate) GetBroadcasts(overhead, limit int) [][]byte {
 }
 
 func (d *DrpDelegate) LocalState(join bool) []byte {
-	services := d.registry.LocalServices()
-	hostnames := make([]string, 0, len(services))
-	for _, svc := range services {
-		hostnames = append(hostnames, svc.Hostname)
-	}
+	hostnames := buildHostnames(d.registry)
 
 	d.mu.RLock()
 	qa := d.quicAddr
@@ -130,28 +122,7 @@ func (d *DrpDelegate) MergeRemoteState(buf []byte, join bool) {
 		return
 	}
 
-	existing := d.registry.ListByNode(nodeID)
-	existingSet := make(map[string]struct{}, len(existing))
-	for _, svc := range existing {
-		existingSet[svc.Hostname] = struct{}{}
-	}
-
-	incomingSet := make(map[string]struct{}, len(ns.Hostnames))
-	for _, hostname := range ns.Hostnames {
-		if hostname == "" {
-			continue
-		}
-		incomingSet[hostname] = struct{}{}
-		if _, ok := existingSet[hostname]; !ok {
-			d.registry.Register(hostname, nodeID, "", false)
-		}
-	}
-
-	for _, svc := range existing {
-		if _, ok := incomingSet[svc.Hostname]; !ok {
-			d.registry.Unregister(svc.Hostname)
-		}
-	}
+	syncRegistryFromHostnames(d.registry, nodeID, ns.Hostnames)
 }
 
 func (d *DrpDelegate) NotifyJoin(node *memberlist.Node) {
@@ -188,37 +159,7 @@ func (d *DrpDelegate) NotifyUpdate(node *memberlist.Node) {
 		return
 	}
 
-	incomingSet := make(map[string]struct{}, len(ns.Hostnames))
-	for _, hostname := range ns.Hostnames {
-		if hostname == "" {
-			continue
-		}
-		incomingSet[hostname] = struct{}{}
-	}
-
-	current := d.registry.ListByNode(node.Name)
-	currentSet := make(map[string]struct{}, len(current))
-	for _, svc := range current {
-		currentSet[svc.Hostname] = struct{}{}
-	}
-
-	added := 0
-	for hostname := range incomingSet {
-		if _, ok := currentSet[hostname]; ok {
-			continue
-		}
-		d.registry.Register(hostname, node.Name, "", false)
-		added++
-	}
-
-	removed := 0
-	for _, svc := range current {
-		if _, ok := incomingSet[svc.Hostname]; ok {
-			continue
-		}
-		d.registry.Unregister(svc.Hostname)
-		removed++
-	}
+	added, removed := syncRegistryFromHostnames(d.registry, node.Name, ns.Hostnames)
 
 	if d.mesh != nil {
 		d.mesh.UpdateNodeMeta(node.Name, ns.Hostnames)
