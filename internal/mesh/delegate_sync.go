@@ -19,7 +19,7 @@ func buildHostnames(reg *registry.Registry) []string {
 // It registers new hostnames and unregisters removed ones.
 // Returns (added, removed) counts.
 // Used by MergeRemoteState() and NotifyUpdate() to avoid duplication.
-func syncRegistryFromHostnames(reg *registry.Registry, nodeID string, incoming []string) (int, int) {
+func syncRegistryFromHostnames(reg *registry.Registry, nodeID string, incoming []string) (added, removed int) {
 	existing := reg.ListByNode(nodeID)
 	existingSet := make(map[string]struct{}, len(existing))
 	for _, svc := range existing {
@@ -27,7 +27,6 @@ func syncRegistryFromHostnames(reg *registry.Registry, nodeID string, incoming [
 	}
 
 	incomingSet := make(map[string]struct{}, len(incoming))
-	added := 0
 	for _, hostname := range incoming {
 		if hostname == "" {
 			continue
@@ -39,7 +38,6 @@ func syncRegistryFromHostnames(reg *registry.Registry, nodeID string, incoming [
 		}
 	}
 
-	removed := 0
 	for _, svc := range existing {
 		if _, ok := incomingSet[svc.Hostname]; !ok {
 			reg.Unregister(svc.Hostname)
