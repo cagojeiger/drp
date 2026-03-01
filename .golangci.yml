@@ -20,9 +20,6 @@ linters:
         - commentFormatting
     revive:
       rules:
-        - name: exported
-          arguments:
-            - disableStutteringCheck
         - name: blank-imports
         - name: context-as-argument
         - name: error-return
