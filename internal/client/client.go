@@ -3,6 +3,7 @@ package client
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -11,6 +12,12 @@ import (
 	"github.com/cagojeiger/drp/internal/protocol"
 	"github.com/cagojeiger/drp/internal/transport"
 	drppb "github.com/cagojeiger/drp/proto/drp"
+)
+
+// Sentinel errors for client-side failure classification.
+var (
+	ErrLoginFailed    = errors.New("login failed")
+	ErrNewProxyFailed = errors.New("new proxy failed")
 )
 
 type Config struct {
@@ -67,11 +74,11 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 	loginResp := env.GetLoginResp()
 	if loginResp == nil || !loginResp.Ok {
-		errMsg := "invalid login response"
+		reason := "invalid login response"
 		if loginResp != nil && loginResp.Error != "" {
-			errMsg = loginResp.Error
+			reason = loginResp.Error
 		}
-		return fmt.Errorf("login failed: %s", errMsg)
+		return fmt.Errorf("%w: %s", ErrLoginFailed, reason)
 	}
 	if err := protocol.WriteEnvelope(conn, &drppb.Envelope{
 		Payload: &drppb.Envelope_NewProxy{NewProxy: &drppb.NewProxy{
@@ -89,11 +96,11 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 	proxyResp := env.GetNewProxyResp()
 	if proxyResp == nil || !proxyResp.Ok {
-		errMsg := "invalid new proxy response"
+		reason := "invalid new proxy response"
 		if proxyResp != nil && proxyResp.Error != "" {
-			errMsg = proxyResp.Error
+			reason = proxyResp.Error
 		}
-		return fmt.Errorf("new proxy failed: %s", errMsg)
+		return fmt.Errorf("%w: %s", ErrNewProxyFailed, reason)
 	}
 	close(c.ready)
 	return c.controlLoop(ctx, conn, r)
