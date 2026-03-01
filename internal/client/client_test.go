@@ -2,6 +2,7 @@ package client_test
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"sync"
@@ -179,8 +180,11 @@ func TestClientLoginFailure(t *testing.T) {
 	defer cancel()
 
 	err := client.New(baseConfig(addrs.Control, "myapp", "myapp.example.com", "127.0.0.1:9"), transport.TCPDialer{}).Run(ctx)
-	if err == nil || !strings.Contains(err.Error(), "login failed: bad api key") {
-		t.Fatalf("Run() error = %v", err)
+	if !errors.Is(err, client.ErrLoginFailed) {
+		t.Fatalf("expected ErrLoginFailed, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "bad api key") {
+		t.Fatalf("expected 'bad api key' in error, got: %v", err)
 	}
 }
 
@@ -195,8 +199,11 @@ func TestClientProxyRegFailure(t *testing.T) {
 	defer cancel()
 
 	err := client.New(baseConfig(addrs.Control, "myapp", "myapp.example.com", "127.0.0.1:9"), transport.TCPDialer{}).Run(ctx)
-	if err == nil || !strings.Contains(err.Error(), "new proxy failed: hostname taken") {
-		t.Fatalf("Run() error = %v", err)
+	if !errors.Is(err, client.ErrNewProxyFailed) {
+		t.Fatalf("expected ErrNewProxyFailed, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "hostname taken") {
+		t.Fatalf("expected 'hostname taken' in error, got: %v", err)
 	}
 }
 

@@ -2,109 +2,14 @@ package relay
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
-	"math/big"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
 )
-
-// quicStreamConn wraps a quic.Stream as a net.Conn.
-// It delegates LocalAddr/RemoteAddr to the parent QUIC connection.
-type quicStreamConn struct {
-	*quic.Stream
-	conn *quic.Conn
-}
-
-func QuicStreamToNetConn(s *quic.Stream, c *quic.Conn) net.Conn {
-	return &quicStreamConn{Stream: s, conn: c}
-}
-
-func (c *quicStreamConn) LocalAddr() net.Addr {
-	if c.conn != nil {
-		return c.conn.LocalAddr()
-	}
-	return &net.UDPAddr{}
-}
-
-func (c *quicStreamConn) RemoteAddr() net.Addr {
-	if c.conn != nil {
-		return c.conn.RemoteAddr()
-	}
-	return &net.UDPAddr{}
-}
-
-func (c *quicStreamConn) Close() error {
-	c.CancelRead(0)
-	return c.Stream.Close()
-}
-
-func GenerateSelfSignedCert() (tls.Certificate, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate ECDSA key: %w", err)
-	}
-
-	serialMax := new(big.Int).Lsh(big.NewInt(1), 128)
-	serial, err := rand.Int(rand.Reader, serialMax)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate certificate serial: %w", err)
-	}
-
-	now := time.Now()
-	tmpl := &x509.Certificate{
-		SerialNumber:          serial,
-		NotBefore:             now,
-		NotAfter:              now.Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              []string{"localhost"},
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("create self-signed certificate: %w", err)
-	}
-
-	keyDER, err := x509.MarshalECPrivateKey(priv)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("marshal ECDSA private key: %w", err)
-	}
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("load X509 key pair: %w", err)
-	}
-	return cert, nil
-}
-
-func ServerTLSConfig(cert tls.Certificate) *tls.Config {
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"drp"},
-		MinVersion:   tls.VersionTLS13,
-	}
-}
-
-func ClientTLSConfig(insecure bool) *tls.Config {
-	return &tls.Config{
-		NextProtos:         []string{"drp"},
-		InsecureSkipVerify: insecure,
-		MinVersion:         tls.VersionTLS13,
-	}
-}
 
 type RelayManager struct {
 	tlsCert  tls.Certificate
@@ -168,11 +73,11 @@ func (rm *RelayManager) acceptLoop(ctx context.Context) {
 			}
 			return
 		}
-		go rm.handleConn(ctx, conn)
+		go rm.acceptQuicStreams(ctx, conn)
 	}
 }
 
-func (rm *RelayManager) handleConn(ctx context.Context, conn *quic.Conn) {
+func (rm *RelayManager) acceptQuicStreams(ctx context.Context, conn *quic.Conn) {
 	for {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {

@@ -11,8 +11,10 @@ import (
 	drppb "github.com/cagojeiger/drp/proto/drp"
 )
 
-var _ memberlist.Delegate = (*DrpDelegate)(nil)
-var _ memberlist.EventDelegate = (*DrpDelegate)(nil)
+var (
+	_ memberlist.Delegate      = (*DrpDelegate)(nil)
+	_ memberlist.EventDelegate = (*DrpDelegate)(nil)
+)
 
 type DrpDelegate struct {
 	nodeID     string
@@ -60,7 +62,7 @@ func (d *DrpDelegate) NodeMeta(limit int) []byte {
 func (d *DrpDelegate) NotifyMsg(buf []byte) {
 	cp := make([]byte, len(buf))
 	copy(cp, buf)
-	go d.handleMsg(cp)
+	go d.handleBroadcastMessage(cp)
 }
 
 func (d *DrpDelegate) GetBroadcasts(overhead, limit int) [][]byte {
@@ -198,7 +200,7 @@ func (d *DrpDelegate) BroadcastServiceUpdate(su *drppb.ServiceUpdate) {
 	})
 }
 
-func (d *DrpDelegate) handleMsg(buf []byte) {
+func (d *DrpDelegate) handleBroadcastMessage(buf []byte) {
 	var su drppb.ServiceUpdate
 	if err := proto.Unmarshal(buf, &su); err != nil {
 		log.Printf("mesh: failed to unmarshal service update: %v", err)

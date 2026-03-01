@@ -9,6 +9,8 @@ linters:
     - unused
     - gocritic
     - misspell
+    - revive
+    - errorlint
   settings:
     gocritic:
       enabled-tags:
@@ -16,11 +18,27 @@ linters:
         - style
       disabled-checks:
         - commentFormatting
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: error-return
+        - name: increment-decrement
+        - name: var-declaration
+        - name: range
+        - name: receiver-naming
+        - name: indent-error-flow
+    errorlint:
+      errorf: true
+      errorf-multi: true
+      asserts: true
+      comparison: true
   exclusions:
     paths:
       - poc
       - .repos
       - vendor
+      - proto
     rules:
       - path: _test\.go
         linters:
@@ -28,7 +46,7 @@ linters:
 
 formatters:
   enable:
-    - gofmt
+    - gofumpt
   exclusions:
     paths:
       - poc
