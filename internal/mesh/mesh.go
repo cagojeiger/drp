@@ -12,6 +12,12 @@ import (
 	drppb "github.com/cagojeiger/drp/proto/drp"
 )
 
+// Service update action constants used in gossip broadcasts.
+const (
+	ActionAdd    = "add"
+	ActionRemove = "remove"
+)
+
 type MeshConfig struct {
 	NodeID   string
 	BindAddr string
@@ -115,7 +121,7 @@ func (m *Mesh) RegisterService(alias, hostname string) {
 	m.registry.Register(hostname, m.config.NodeID, alias, true)
 	m.delegate.BroadcastServiceUpdate(&drppb.ServiceUpdate{
 		NodeId:     m.config.NodeID,
-		Action:     "add",
+		Action:     ActionAdd,
 		ProxyAlias: alias,
 		Hostname:   hostname,
 	})
@@ -135,14 +141,14 @@ func (m *Mesh) UnregisterService(hostname string) {
 
 	m.delegate.BroadcastServiceUpdate(&drppb.ServiceUpdate{
 		NodeId:     m.config.NodeID,
-		Action:     "remove",
+		Action:     ActionRemove,
 		ProxyAlias: proxyAlias,
 		Hostname:   hostname,
 	})
 	for i := 1; i < removeBroadcastAttempts; i++ {
 		m.delegate.BroadcastServiceUpdate(&drppb.ServiceUpdate{
 			NodeId:     m.config.NodeID,
-			Action:     "remove",
+			Action:     ActionRemove,
 			ProxyAlias: proxyAlias,
 			Hostname:   hostname,
 		})

@@ -11,6 +11,21 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+const (
+	quicIdleTimeout     = 30 * time.Second
+	quicMaxStreams      = 10000
+	quicKeepAlive       = 10 * time.Second
+	streamChannelBuffer = 256
+)
+
+func defaultQuicConfig() *quic.Config {
+	return &quic.Config{
+		MaxIdleTimeout:     quicIdleTimeout,
+		MaxIncomingStreams: quicMaxStreams,
+		KeepAlivePeriod:    quicKeepAlive,
+	}
+}
+
 type RelayManager struct {
 	tlsCert  tls.Certificate
 	listener *quic.Listener
@@ -27,20 +42,15 @@ func NewRelayManager(tlsCert tls.Certificate) *RelayManager {
 	return &RelayManager{
 		tlsCert:   tlsCert,
 		peers:     make(map[string]*quic.Conn),
-		streams:   make(chan net.Conn, 256),
+		streams:   make(chan net.Conn, streamChannelBuffer),
 		acceptErr: make(chan error, 1),
 	}
 }
 
 func (rm *RelayManager) Listen(addr string) error {
 	tlsCfg := ServerTLSConfig(rm.tlsCert)
-	quicCfg := &quic.Config{
-		MaxIdleTimeout:     30 * time.Second,
-		MaxIncomingStreams: 10000,
-		KeepAlivePeriod:    10 * time.Second,
-	}
 
-	listener, err := quic.ListenAddr(addr, tlsCfg, quicCfg)
+	listener, err := quic.ListenAddr(addr, tlsCfg, defaultQuicConfig())
 	if err != nil {
 		return fmt.Errorf("listen QUIC on %s: %w", addr, err)
 	}
@@ -134,13 +144,8 @@ func (rm *RelayManager) DialStream(ctx context.Context, peerAddr string) (net.Co
 	}
 
 	tlsCfg := ClientTLSConfig(true)
-	quicCfg := &quic.Config{
-		MaxIdleTimeout:     30 * time.Second,
-		MaxIncomingStreams: 10000,
-		KeepAlivePeriod:    10 * time.Second,
-	}
 
-	newConn, err := quic.DialAddr(ctx, peerAddr, tlsCfg, quicCfg)
+	newConn, err := quic.DialAddr(ctx, peerAddr, tlsCfg, defaultQuicConfig())
 	if err != nil {
 		return nil, fmt.Errorf("dial QUIC peer %s: %w", peerAddr, err)
 	}

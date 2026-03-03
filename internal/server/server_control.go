@@ -10,6 +10,8 @@ import (
 	drppb "github.com/cagojeiger/drp/proto/drp"
 )
 
+const workConnQueueTimeout = 10 * time.Second
+
 func (s *Server) handleControl(conn net.Conn) {
 	r := bufio.NewReader(conn)
 	env, err := protocol.ReadEnvelope(r)
@@ -127,7 +129,7 @@ func (s *Server) acceptWorkConn(conn net.Conn, nwc *drppb.NewWorkConn) {
 
 	select {
 	case entry.workQueue <- conn:
-	case <-time.After(10 * time.Second):
+	case <-time.After(workConnQueueTimeout):
 		_ = conn.Close()
 	}
 }

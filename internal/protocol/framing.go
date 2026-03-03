@@ -9,6 +9,11 @@ import (
 	"google.golang.org/protobuf/encoding/protodelim"
 )
 
+const (
+	maxEnvelopeSize = 4 << 20   // 4 MiB
+	pipeBufSize     = 64 * 1024 // 64 KiB
+)
+
 func WriteEnvelope(w io.Writer, env *drppb.Envelope) error {
 	_, err := protodelim.MarshalTo(w, env)
 	return err
@@ -16,12 +21,12 @@ func WriteEnvelope(w io.Writer, env *drppb.Envelope) error {
 
 func ReadEnvelope(r *bufio.Reader) (*drppb.Envelope, error) {
 	env := &drppb.Envelope{}
-	err := (protodelim.UnmarshalOptions{MaxSize: 4 << 20}).UnmarshalFrom(r, env)
+	err := (protodelim.UnmarshalOptions{MaxSize: maxEnvelopeSize}).UnmarshalFrom(r, env)
 	return env, err
 }
 
 func Pipe(dst io.WriteCloser, src io.Reader) error {
-	buf := make([]byte, 64*1024)
+	buf := make([]byte, pipeBufSize)
 	_, err := io.CopyBuffer(dst, src, buf)
 	return err
 }

@@ -22,7 +22,7 @@ type realRelayer struct {
 func (r *realRelayer) DialStream(ctx context.Context, nodeID string) (net.Conn, error) {
 	peerAddr := r.resolvePeerQuicAddr(nodeID)
 	if peerAddr == "" {
-		return nil, fmt.Errorf("peer %s: address not found", nodeID)
+		return nil, fmt.Errorf("%w: %s", ErrPeerNotFound, nodeID)
 	}
 	return r.relay.DialStream(ctx, peerAddr)
 }

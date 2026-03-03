@@ -13,6 +13,14 @@ import (
 var (
 	ErrServiceNotFound = errors.New("service not found")
 	ErrWorkConnTimeout = errors.New("work connection timeout")
+	ErrPeerNotFound    = errors.New("peer address not found")
+)
+
+// Pre-built HTTP error responses to avoid repeated string allocations.
+var (
+	httpBadRequest     = []byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 15\r\n\r\n400 Bad Request")
+	httpBadGateway     = []byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway")
+	httpGatewayTimeout = []byte("HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 19\r\n\r\n504 Gateway Timeout")
 )
 
 // ServiceLookup resolves a hostname to service routing info.
