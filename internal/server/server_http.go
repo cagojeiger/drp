@@ -6,10 +6,12 @@ import (
 	"github.com/cagojeiger/drp/internal/protocol"
 )
 
+const initialReadBufSize = 4096
+
 func (s *Server) handleHTTP(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
-	buf := make([]byte, 4096)
+	buf := make([]byte, initialReadBufSize)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return
@@ -18,7 +20,7 @@ func (s *Server) handleHTTP(conn net.Conn) {
 
 	hostname := protocol.ExtractHost(buf)
 	if hostname == "" {
-		_, _ = conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 15\r\n\r\n400 Bad Request"))
+		_, _ = conn.Write(httpBadRequest)
 		return
 	}
 
@@ -28,7 +30,7 @@ func (s *Server) handleHTTP(conn net.Conn) {
 func (s *Server) handleHTTPS(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
-	buf := make([]byte, 4096)
+	buf := make([]byte, initialReadBufSize)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return

@@ -16,7 +16,7 @@ import (
 func (s *Server) routeRequest(hostname string, userConn net.Conn, buffered []byte) {
 	info, found := s.lookup.Lookup(hostname)
 	if !found {
-		_, _ = userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+		_, _ = userConn.Write(httpBadGateway)
 		return
 	}
 	if info.IsLocal {
@@ -30,10 +30,10 @@ func (s *Server) localRoute(info registry.ServiceInfo, userConn net.Conn, buf []
 	workConn, err := s.broker.RequestAndWait(info.ProxyAlias, 10*time.Second)
 	if err != nil {
 		if errors.Is(err, ErrWorkConnTimeout) {
-			_, _ = userConn.Write([]byte("HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 19\r\n\r\n504 Gateway Timeout"))
+			_, _ = userConn.Write(httpGatewayTimeout)
 		} else {
 			log.Printf("work conn error: %v", err)
-			_, _ = userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+			_, _ = userConn.Write(httpBadGateway)
 		}
 		return
 	}
@@ -48,7 +48,7 @@ func (s *Server) remoteRelay(info registry.ServiceInfo, userConn net.Conn, buf [
 	stream, err := s.relayer.DialStream(ctx, info.NodeID)
 	if err != nil {
 		log.Printf("relay dial to %s failed: %v", info.NodeID, err)
-		_, _ = userConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n\r\n502 Bad Gateway"))
+		_, _ = userConn.Write(httpBadGateway)
 		return
 	}
 	defer func() { _ = stream.Close() }()

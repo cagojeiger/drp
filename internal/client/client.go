@@ -14,6 +14,8 @@ import (
 	drppb "github.com/cagojeiger/drp/proto/drp"
 )
 
+const heartbeatInterval = 30 * time.Second
+
 // Sentinel errors for client-side failure classification.
 var (
 	ErrLoginFailed    = errors.New("login failed")
@@ -117,7 +119,7 @@ func (c *Client) controlLoop(ctx context.Context, conn net.Conn, r *bufio.Reader
 	}()
 
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 		for {
 			select {

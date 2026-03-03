@@ -127,115 +127,10 @@ func (d *DrpDelegate) MergeRemoteState(buf []byte, join bool) {
 	syncRegistryFromHostnames(d.registry, nodeID, ns.Hostnames)
 }
 
-func (d *DrpDelegate) NotifyJoin(node *memberlist.Node) {
-	ns, ok := d.parseNodeMeta(node)
-	if !ok {
-		return
-	}
-
-	for _, hostname := range ns.Hostnames {
-		if hostname == "" {
-			continue
-		}
-		d.registry.Register(hostname, node.Name, "", false)
-	}
-
-	if d.mesh != nil {
-		d.mesh.UpdateNodeMeta(node.Name, ns.Hostnames)
-	}
-
-	log.Printf("node joined: %s with %d services", node.Name, len(ns.Hostnames))
-}
-
-func (d *DrpDelegate) NotifyLeave(node *memberlist.Node) {
-	d.registry.RemoveByNode(node.Name)
-	if d.mesh != nil {
-		d.mesh.RemoveNodeMeta(node.Name)
-	}
-	log.Printf("node left: %s", node.Name)
-}
-
-func (d *DrpDelegate) NotifyUpdate(node *memberlist.Node) {
-	ns, ok := d.parseNodeMeta(node)
-	if !ok {
-		return
-	}
-
-	added, removed := syncRegistryFromHostnames(d.registry, node.Name, ns.Hostnames)
-
-	if d.mesh != nil {
-		d.mesh.UpdateNodeMeta(node.Name, ns.Hostnames)
-	}
-
-	log.Printf("node updated: %s, +%d -%d services", node.Name, added, removed)
-}
-
 func (d *DrpDelegate) SetBroadcastQueue(q *memberlist.TransmitLimitedQueue) {
 	d.mu.Lock()
 	d.broadcasts = q
 	d.mu.Unlock()
-}
-
-func (d *DrpDelegate) BroadcastServiceUpdate(su *drppb.ServiceUpdate) {
-	if su == nil {
-		return
-	}
-
-	msg, err := proto.Marshal(su)
-	if err != nil {
-		log.Printf("mesh: failed to marshal service update: %v", err)
-		return
-	}
-
-	d.mu.RLock()
-	q := d.broadcasts
-	d.mu.RUnlock()
-	if q == nil {
-		return
-	}
-
-	q.QueueBroadcast(&serviceBroadcast{
-		name: "svc:" + su.Hostname,
-		msg:  msg,
-	})
-}
-
-func (d *DrpDelegate) handleBroadcastMessage(buf []byte) {
-	var su drppb.ServiceUpdate
-	if err := proto.Unmarshal(buf, &su); err != nil {
-		log.Printf("mesh: failed to unmarshal service update: %v", err)
-		return
-	}
-
-	switch su.Action {
-	case "add":
-		if su.Hostname == "" || su.NodeId == "" {
-			return
-		}
-		d.registry.Register(su.Hostname, su.NodeId, su.ProxyAlias, false)
-	case "remove":
-		if su.Hostname == "" {
-			return
-		}
-		d.registry.Unregister(su.Hostname)
-	default:
-		log.Printf("mesh: unknown service update action %q", su.Action)
-		return
-	}
-
-	d.mu.RLock()
-	q := d.broadcasts
-	d.mu.RUnlock()
-	if q == nil {
-		return
-	}
-
-	cp := make([]byte, len(buf))
-	copy(cp, buf)
-	q.QueueBroadcast(&serviceBroadcast{
-		name: "svc:" + su.Hostname,
-		msg:  cp,
-	})
 }
 
 func (d *DrpDelegate) parseNodeMeta(node *memberlist.Node) (*drppb.NodeServices, bool) {
@@ -248,22 +143,3 @@ func (d *DrpDelegate) parseNodeMeta(node *memberlist.Node) (*drppb.NodeServices,
 	}
 	return &ns, true
 }
-
-type serviceBroadcast struct {
-	name string
-	msg  []byte
-}
-
-func (b *serviceBroadcast) Invalidates(other memberlist.Broadcast) bool {
-	ob, ok := other.(*serviceBroadcast)
-	if !ok {
-		return false
-	}
-	return b.name == ob.name
-}
-
-func (b *serviceBroadcast) Message() []byte { return b.msg }
-
-func (b *serviceBroadcast) Finished() {}
-
-func (b *serviceBroadcast) Name() string { return b.name }
