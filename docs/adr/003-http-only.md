@@ -34,6 +34,16 @@ HTTP 프록시만 지원합니다.
 | work conn 암호화 | `transport.useEncryption` |
 | work conn 압축 | `transport.useCompression` |
 
+## HTTP/1.1 기반
+
+HTTP/1.1만 지원하고 HTTP/2(h2c)는 지원하지 않습니다.
+
+| 이유 | 설명 |
+|------|------|
+| WebSocket 호환 | HTTP/1.1의 `101 Switching Protocols`로 동작. HTTP/2는 다른 메커니즘(RFC 8441)이라 복잡도 증가 |
+| frpc 호환 | frpc는 work connection을 통해 HTTP/1.1 요청/응답을 전달. HTTP/2를 넣어도 frpc 구간에는 영향 없음 |
+| 인그레스 위임 | 외부 클라이언트 ↔ 인그레스 구간에서 HTTP/2를 처리하면 됨. drps가 직접 할 필요 없음 |
+
 ## 암호화 정책
 
 drps는 앞단 인그레스에 TLS를 맡기므로 자체 TLS를 구현하지 않습니다.
