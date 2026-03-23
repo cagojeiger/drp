@@ -15,23 +15,23 @@
 
 ```mermaid
 flowchart TD
-    Req[HTTP 요청 도착] --> MW[보안 헤더 미들웨어<br/>X-Content-Type-Options<br/>X-Frame-Options]
-    MW --> Lookup{Router.Lookup<br/>domain+path}
-    Lookup -->|없음| E404[404 Not Found]
-    Lookup -->|있음| AuthCheck{Basic Auth<br/>설정?}
-    AuthCheck -->|아니오| Proxy[ReverseProxy]
-    AuthCheck -->|예| AuthVerify{인증 성공?<br/>ConstantTimeCompare}
-    AuthVerify -->|실패| E401[401 Unauthorized]
-    AuthVerify -->|성공| Proxy
-    Proxy --> RT[sharedTransport.RoundTrip]
-    RT --> WC[Bridge: GetWorkConn]
-    WC -->|실패| E502[502 Bad Gateway]
-    WC -->|성공| Write[HTTP 요청 전달]
-    Write --> Read{응답 읽기}
-    Read -->|타임아웃| E504[504 Gateway Timeout]
-    Read -->|성공| WS{101?}
-    WS -->|아니오| ModResp[응답 헤더 조작<br/>→ 반환]
-    WS -->|예| Relay[WebSocket<br/>양방향 릴레이]
+    Req["HTTP Request"] --> MW["Security Headers Middleware"]
+    MW --> Lookup{"Router.Lookup"}
+    Lookup -->|"not found"| E404["404 Not Found"]
+    Lookup -->|"found"| AuthCheck{"Basic Auth?"}
+    AuthCheck -->|"no"| Proxy["ReverseProxy"]
+    AuthCheck -->|"yes"| AuthVerify{"Auth OK?"}
+    AuthVerify -->|"fail"| E401["401 Unauthorized"]
+    AuthVerify -->|"pass"| Proxy
+    Proxy --> RT["sharedTransport.RoundTrip"]
+    RT --> WC["Bridge GetWorkConn"]
+    WC -->|"fail"| E502["502 Bad Gateway"]
+    WC -->|"ok"| Write["Send HTTP Request"]
+    Write --> Read{"Read Response"}
+    Read -->|"timeout"| E504["504 Gateway Timeout"]
+    Read -->|"ok"| WS{"Status 101?"}
+    WS -->|"no"| ModResp["ModifyResponse + Return"]
+    WS -->|"yes"| Relay["WebSocket Bidirectional Relay"]
 ```
 
 ## 헤더 조작
@@ -40,18 +40,18 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    Req[원본 요청] --> HHR[HostHeaderRewrite<br/>Host 헤더 교체]
-    HHR --> HI[Headers 주입<br/>차단 목록 필터링]
-    HI --> XFF[X-Forwarded-For<br/>자동 추가]
-    XFF --> Out[변환된 요청]
+    Req["Original Request"] --> HHR["HostHeaderRewrite"]
+    HHR --> HI["Headers Injection"]
+    HI --> XFF["X-Forwarded-For"]
+    XFF --> Out["Modified Request"]
 ```
 
 ### 백엔드 → 응답
 
 ```mermaid
 flowchart LR
-    Resp[원본 응답] --> RHI[ResponseHeaders 주입<br/>차단 목록 필터링]
-    RHI --> Out[변환된 응답]
+    Resp["Original Response"] --> RHI["ResponseHeaders Injection"]
+    RHI --> Out["Modified Response"]
 ```
 
 ### 헤더 주입 차단 목록
@@ -70,14 +70,14 @@ sequenceDiagram
     participant F as frpc
     participant L as LocalService
 
-    C->>S: GET /ws (Upgrade: websocket)
-    S->>F: 동일 요청 전달
-    F->>L: 동일 요청 전달
+    C->>S: GET /ws Upgrade websocket
+    S->>F: forward request
+    F->>L: forward request
     L-->>F: 101 Switching Protocols
     F-->>S: 101 Switching Protocols
     S-->>C: 101 Switching Protocols
 
-    Note over C,L: 이후 raw 양방향 릴레이
+    Note over C,L: bidirectional raw relay
     C->>S: WebSocket frame
     S->>F: relay
     F->>L: relay
