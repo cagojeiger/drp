@@ -9,18 +9,18 @@ frpc 클라이언트와의 프로토콜 통신을 담당합니다.
 
 ```mermaid
 graph TB
-    frpc[frpc Client]
+    FRPC["frpc Client"]
 
     subgraph YamuxSession["yamux Session"]
-        S0["Stream 0: 제어 채널 (AES)"]
-        S1["Stream 1: WorkConn"]
-        S2["Stream 2: WorkConn"]
-        SN["Stream N: WorkConn"]
+        S0["Stream 0 Control AES"]
+        S1["Stream 1 WorkConn"]
+        S2["Stream 2 WorkConn"]
+        SN["Stream N WorkConn"]
     end
 
-    frpc -->|TCP| YamuxSession
-    S0 --> Ctrl[Control]
-    S1 --> BL[Bridge Layer]
+    FRPC -->|"TCP"| YamuxSession
+    S0 --> Ctrl["Control"]
+    S1 --> BL["Bridge Layer"]
     S2 --> BL
     SN --> BL
 ```
@@ -34,15 +34,15 @@ sequenceDiagram
     participant F as frpc
     participant P as ProtocolLayer
 
-    F->>P: Login (plaintext)
-    Note right of F: version, run_id,<br/>privilege_key MD5,<br/>pool_count
+    F->>P: Login plaintext
+    Note right of F: version run_id privilege_key pool_count
 
     P->>P: verify MD5
-    P-->>F: LoginResp (plaintext)
-    Note left of P: version, run_id, error
+    P-->>F: LoginResp plaintext
+    Note left of P: version run_id error
 
     P->>P: setup CryptoReadWriter
-    Note over P: AES-128-CFB<br/>key=token salt=frp
+    Note over P: AES-128-CFB key=token salt=frp
 ```
 
 **중요:** Login 메시지 자체는 **평문**. Login 성공 후부터 암호화.
@@ -76,11 +76,11 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    Token[auth.token]
+    Token["auth.token"]
 
-    Token -->|MD5| Auth["1. 인증 privilege_key"]
-    Token -->|AES| Ctrl2["2. 제어 채널 (Login 이후)"]
-    Token -->|AES| Work["3. 워크 커넥션 (useEncryption)"]
+    Token -->|"MD5"| Auth["Auth privilege_key"]
+    Token -->|"AES"| Ctrl2["Control Channel"]
+    Token -->|"AES"| Work["WorkConn useEncryption"]
 ```
 
 ## 프록시 등록 흐름
@@ -91,8 +91,8 @@ sequenceDiagram
     participant P as ProtocolLayer
     participant B as BridgeLayer
 
-    F->>P: NewProxy (AES encrypted)
-    Note right of F: type http, domains,<br/>locations, headers,<br/>useEncryption
+    F->>P: NewProxy AES encrypted
+    Note right of F: type http domains locations headers
 
     P->>P: validate proxy_type
     P->>P: validate subdomain
@@ -114,12 +114,12 @@ sequenceDiagram
 
     Note over P,F: Pool init after Login
     P-->>F: ReqWorkConn x pool_count
-    F->>P: NewWorkConn (new yamux stream)
+    F->>P: NewWorkConn new yamux stream
     P->>P: store in workConnCh
 
     Note over S: HTTP request arrives
-    S->>B: GetWorkConn()
-    B->>P: Control.GetWorkConn()
+    S->>B: GetWorkConn
+    B->>P: Control.GetWorkConn
 
     alt PoolHit
         P-->>B: conn immediate
