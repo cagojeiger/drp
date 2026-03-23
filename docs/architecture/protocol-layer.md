@@ -11,18 +11,18 @@ frpc 클라이언트와의 프로토콜 통신을 담당합니다.
 graph TB
     frpc[frpc Client]
 
-    subgraph yamux-Session
-        S0[Stream-0: 제어 채널<br/>AES-128-CFB 암호화]
-        S1[Stream-1: WorkConn]
-        S2[Stream-2: WorkConn]
-        SN[Stream-N: WorkConn]
+    subgraph YamuxSession["yamux Session"]
+        S0["Stream 0: 제어 채널 (AES)"]
+        S1["Stream 1: WorkConn"]
+        S2["Stream 2: WorkConn"]
+        SN["Stream N: WorkConn"]
     end
 
-    frpc -->|TCP 1개| yamux-Session
-    S0 --> Control
-    S1 --> BridgeLayer
-    S2 --> BridgeLayer
-    SN --> BridgeLayer
+    frpc -->|TCP| YamuxSession
+    S0 --> Ctrl[Control]
+    S1 --> BL[Bridge Layer]
+    S2 --> BL
+    SN --> BL
 ```
 
 설정: `MaxStreamWindowSize = 6MB`, `KeepAliveInterval = 30s`
@@ -34,15 +34,15 @@ sequenceDiagram
     participant F as frpc
     participant P as ProtocolLayer
 
-    F->>P: Login (평문)
-    Note right of F: version, run_id,<br/>privilege_key: MD5(token+ts),<br/>pool_count
+    F->>P: Login (plaintext)
+    Note right of F: version, run_id,<br/>privilege_key MD5,<br/>pool_count
 
-    P->>P: MD5(token+timestamp) 검증
-    P-->>F: LoginResp (평문)
+    P->>P: verify MD5
+    P-->>F: LoginResp (plaintext)
     Note left of P: version, run_id, error
 
-    P->>P: CryptoReadWriter 설정
-    Note over P: 이후 모든 제어 메시지<br/>AES-128-CFB 암호화<br/>key=token, salt=frp
+    P->>P: setup CryptoReadWriter
+    Note over P: AES-128-CFB<br/>key=token salt=frp
 ```
 
 **중요:** Login 메시지 자체는 **평문**. Login 성공 후부터 암호화.
@@ -78,9 +78,9 @@ sequenceDiagram
 graph LR
     Token[auth.token]
 
-    Token -->|"MD5(token+ts)"| Auth[1.인증<br/>privilege_key]
-    Token -->|"AES key=token<br/>salt=frp"| Ctrl[2.제어-채널<br/>Login-이후]
-    Token -->|"AES key=token<br/>salt=frp"| Work[3.워크-커넥션<br/>useEncryption=true]
+    Token -->|MD5| Auth["1. 인증 privilege_key"]
+    Token -->|AES| Ctrl2["2. 제어 채널 (Login 이후)"]
+    Token -->|AES| Work["3. 워크 커넥션 (useEncryption)"]
 ```
 
 ## 프록시 등록 흐름
@@ -91,15 +91,15 @@ sequenceDiagram
     participant P as ProtocolLayer
     participant B as BridgeLayer
 
-    F->>P: NewProxy (AES 암호화)
-    Note right of F: type:http, domains,<br/>locations, headers,<br/>useEncryption
+    F->>P: NewProxy (AES encrypted)
+    Note right of F: type http, domains,<br/>locations, headers,<br/>useEncryption
 
-    P->>P: proxy_type 검증 (http만)
-    P->>P: subdomain 검증
-    P->>P: 도메인 목록 구성
-    P->>P: RouteConfig 생성
-    P->>B: ProxyRegistrar.Register(RouteConfig)
-    B-->>P: OK / conflict error
+    P->>P: validate proxy_type
+    P->>P: validate subdomain
+    P->>P: build domain list
+    P->>P: create RouteConfig
+    P->>B: Register RouteConfig
+    B-->>P: OK or conflict
     P-->>F: NewProxyResp
 ```
 
@@ -112,23 +112,23 @@ sequenceDiagram
     participant P as ProtocolLayer
     participant F as frpc
 
-    Note over P,F: 풀 초기화 (Login 직후)
-    P-->>F: ReqWorkConn (pool_count만큼)
-    F->>P: NewWorkConn (새 yamux 스트림)
-    P->>P: workConnCh에 저장
+    Note over P,F: Pool init after Login
+    P-->>F: ReqWorkConn x pool_count
+    F->>P: NewWorkConn (new yamux stream)
+    P->>P: store in workConnCh
 
-    Note over S: HTTP 요청 도착
+    Note over S: HTTP request arrives
     S->>B: GetWorkConn()
     B->>P: Control.GetWorkConn()
 
-    alt 풀에-있음
-        P-->>B: conn (즉시)
-        P-->>F: ReqWorkConn (보충)
-    else 풀-비어있음
+    alt PoolHit
+        P-->>B: conn immediate
+        P-->>F: ReqWorkConn refill
+    else PoolMiss
         P-->>F: ReqWorkConn
         F->>P: NewWorkConn
-        P-->>B: conn (대기 후)
-        P-->>F: ReqWorkConn (보충)
+        P-->>B: conn after wait
+        P-->>F: ReqWorkConn refill
     end
 ```
 
@@ -140,16 +140,16 @@ sequenceDiagram
     participant P as ProtocolLayer
     participant B as BridgeLayer
 
-    Note over F: 연결 끊김 후 재연결
+    Note over F: reconnect after disconnect
 
-    F->>P: Login (같은 run_id)
-    P->>P: ControlManager에서 기존 Control 발견
-    P->>B: 기존 라우트 해제
-    P->>P: 기존 워크 커넥션 정리
-    P->>P: 새 Control 생성 + 포인터 교체
+    F->>P: Login same run_id
+    P->>P: find existing Control
+    P->>B: Unregister old routes
+    P->>P: close old WorkConns
+    P->>P: create new Control
 
-    F->>P: NewProxy (재등록)
-    P->>B: Register(RouteConfig)
+    F->>P: NewProxy re-register
+    P->>B: Register RouteConfig
 ```
 
 ## Bridge Layer와의 인터페이스

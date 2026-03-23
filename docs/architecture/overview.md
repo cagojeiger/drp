@@ -24,8 +24,8 @@ graph TB
         BL[Bridge Layer]
         PL[Protocol Layer]
 
-        SL -->|RouteConfig 조회| BL
-        BL -->|WorkConn 획득| PL
+        SL -->|RouteConfig| BL
+        BL -->|WorkConn| PL
     end
 
     PL -->|yamux + AES| frpc
@@ -48,19 +48,19 @@ sequenceDiagram
     participant P as ProtocolLayer
     participant F as frpc
 
-    C->>S: GET / Host: app.example.com
-    S->>B: Lookup(domain, path)
+    C->>S: GET / Host app.example.com
+    S->>B: Lookup domain path
     B-->>S: RouteConfig
-    S->>S: Basic Auth 검증
+    S->>S: BasicAuth
     S->>B: GetWorkConn()
     B->>P: Control.GetWorkConn()
     P-->>B: yamux stream
-    B->>B: AES/snappy 래핑 (옵션)
+    B->>B: AES snappy wrap
     B-->>S: net.Conn
     S->>F: HTTP 요청 전달
     F-->>S: HTTP 응답
-    S->>S: 응답 헤더 조작
-    S-->>C: HTTP 응답 반환
+    S->>S: ModifyResponse
+    S-->>C: HTTP Response
 ```
 
 ## frpc 등록 흐름
@@ -71,21 +71,21 @@ sequenceDiagram
     participant P as ProtocolLayer
     participant B as BridgeLayer
 
-    F->>P: TCP 연결 (yamux 세션)
-    F->>P: Login (평문)
-    P->>P: 인증 검증
+    F->>P: TCP connect yamux
+    F->>P: Login plaintext
+    P->>P: verify auth
     P-->>F: LoginResp
-    P->>P: 제어 채널 AES 암호화 시작
+    P->>P: start AES encryption
 
-    F->>P: NewProxy (암호화)
-    Note right of P: type:http, domain, location,<br/>headers, auth, encryption
-    P->>B: ProxyRegistrar.Register(RouteConfig)
-    B->>B: 라우팅 테이블에 등록
+    F->>P: NewProxy encrypted
+    Note right of P: type http domain location<br/>headers auth encryption
+    P->>B: Register RouteConfig
+    B->>B: add to routing table
     P-->>F: NewProxyResp
 
-    P-->>F: ReqWorkConn (풀 준비)
-    F->>P: NewWorkConn (새 yamux 스트림)
-    P->>P: workConnCh에 저장
+    P-->>F: ReqWorkConn pool init
+    F->>P: NewWorkConn new stream
+    P->>P: store in workConnCh
 ```
 
 ## 레이어 독립성
@@ -112,9 +112,9 @@ graph LR
 
     RP -->|Lookup| Router
     Ctrl -->|Register| IF
-    IF -.->|구현| Router
+    IF -.->|impl| Router
     RP -->|GetWorkConn| RC
-    RC -->|호출| Pool
+    RC -->|call| Pool
 ```
 
 각 레이어는 인터페이스를 통해서만 소통합니다.

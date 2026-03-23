@@ -11,11 +11,11 @@ flowchart LR
     BL[Bridge Layer<br/>라우팅+연결]
     PL[Protocol Layer<br/>워크 커넥션]
 
-    SL -->|"1.Lookup(domain,path)"| BL
-    BL -->|"2.GetWorkConn()"| PL
-    PL -->|"3.yamux stream"| BL
-    BL -->|"4.암호화 래핑"| BL
-    BL -->|"5.net.Conn 반환"| SL
+    SL -->|1 Lookup| BL
+    BL -->|2 GetWorkConn| PL
+    PL -->|3 yamux stream| BL
+    BL --> Wrap["4 암호화 래핑"]
+    Wrap -->|5 net.Conn| SL
 ```
 
 ## RouteConfig: 두 레이어를 연결하는 구조체
@@ -36,9 +36,9 @@ classDiagram
         +UseCompression bool
     }
 
-    ServiceLayer ..> RouteConfig : Lookup으로 조회
-    ProtocolLayer ..> RouteConfig : GetWorkConn 제공
-    BridgeLayer --> RouteConfig : 생성 및 관리
+    ServiceLayer ..> RouteConfig : Lookup
+    ProtocolLayer ..> RouteConfig : GetWorkConn
+    BridgeLayer --> RouteConfig : manage
 ```
 
 `GetWorkConn`이 **Protocol Layer와 Service Layer를 연결하는 유일한 접점**입니다.
@@ -141,7 +141,7 @@ flowchart LR
 
     F1 -->|연결| A
     User -->|"app.example.com"| B
-    B -.->|"frpc-1은 A에 있음!"| A
+    B -.->|frpc1 is on A| A
 ```
 
 ### 해결: 라우팅 정보에 drps 인스턴스 포함
