@@ -17,10 +17,15 @@ type Pool struct {
 	mu         sync.Mutex
 }
 
-// New creates a pool. requestFn is called to request a new work connection from frpc.
-func New(requestFn func()) *Pool {
+// New creates a pool with the given capacity.
+// requestFn is called to request a new work connection from frpc.
+func New(requestFn func(), capacity ...int) *Pool {
+	cap := 64
+	if len(capacity) > 0 && capacity[0] > 0 {
+		cap = capacity[0]
+	}
 	return &Pool{
-		conns:     make(chan net.Conn, 64),
+		conns:     make(chan net.Conn, cap),
 		requestFn: requestFn,
 	}
 }

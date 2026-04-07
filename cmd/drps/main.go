@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/hashicorp/yamux"
+	"github.com/kangheeyong/drp/internal/config"
 	"github.com/kangheeyong/drp/internal/crypto"
 	"github.com/kangheeyong/drp/internal/msg"
 	"github.com/kangheeyong/drp/internal/pool"
@@ -16,16 +17,14 @@ import (
 )
 
 func main() {
-	token := "test-token"
-	frpcAddr := ":17000"
-	httpAddr := ":18080"
+	cfg := config.Load()
 
 	rt := router.New()
 	registry := pool.NewRegistry()
-	aesKey := crypto.DeriveKey(token)
+	aesKey := crypto.DeriveKey(cfg.Token)
 
 	h := &server.Handler{
-		Token:  token,
+		Token:  cfg.Token,
 		Router: rt,
 		OnControlClose: func(runID string) {
 			log.Printf("control closed: runID=%s", runID)
@@ -34,7 +33,7 @@ func main() {
 	}
 	h.OnWorkConn = func(conn net.Conn, m *msg.NewWorkConn) {
 		log.Printf("work conn: runID=%s", m.RunID)
-		p := registry.GetOrCreate(m.RunID, h.ReqWorkConnFunc(m.RunID))
+		p := registry.GetOrCreate(m.RunID, h.ReqWorkConnFunc(m.RunID), cfg.PoolCapacity)
 		p.Put(conn)
 	}
 
@@ -43,11 +42,11 @@ func main() {
 	}, aesKey)
 
 	// frpc 리스너
-	frpcLn, err := net.Listen("tcp", frpcAddr)
+	frpcLn, err := net.Listen("tcp", cfg.FrpcAddr)
 	if err != nil {
 		log.Fatalf("frpc listen: %v", err)
 	}
-	log.Printf("drps listening on %s (frpc), %s (http)", frpcAddr, httpAddr)
+	log.Printf("drps listening on %s (frpc), %s (http)", cfg.FrpcAddr, cfg.HTTPAddr)
 
 	go func() {
 		for {
@@ -60,7 +59,7 @@ func main() {
 		}
 	}()
 
-	log.Fatal(http.ListenAndServe(httpAddr, proxyHandler))
+	log.Fatal(http.ListenAndServe(cfg.HTTPAddr, proxyHandler))
 }
 
 func handleTCP(conn net.Conn, h *server.Handler) {
