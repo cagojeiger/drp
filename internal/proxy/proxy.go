@@ -47,7 +47,7 @@ func NewHandler(rt *router.Router, poolLookup PoolLookup, aesKey []byte) *Handle
 		Rewrite: func(r *httputil.ProxyRequest) {
 			cfg := r.In.Context().Value(routeCtxKey{}).(*router.RouteConfig)
 			r.Out.URL.Scheme = "http"
-			r.Out.URL.Host = r.In.Host
+			r.Out.URL.Host = cfg.Domain + "." + cfg.Location + "." + cfg.ProxyName + ".drps"
 			if cfg.HostHeaderRewrite != "" {
 				r.Out.Host = cfg.HostHeaderRewrite
 			}
