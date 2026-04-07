@@ -7,11 +7,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"sync"
 	"time"
 
 	"github.com/kangheeyong/drp/internal/pool"
 	"github.com/kangheeyong/drp/internal/router"
 	"github.com/kangheeyong/drp/internal/wrap"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 const workConnTimeout = 10 * time.Second
@@ -60,12 +63,14 @@ func NewHandler(rt *router.Router, poolLookup PoolLookup, aesKey []byte) *Handle
 			return nil
 		},
 		Transport: &http.Transport{
-			IdleConnTimeout:     60 * time.Second,
-			MaxIdleConnsPerHost: 5,
+			ResponseHeaderTimeout: 60 * time.Second,
+			IdleConnTimeout:       60 * time.Second,
+			MaxIdleConnsPerHost:   5,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return h.dialWorkConn(ctx)
 			},
 		},
+		BufferPool: &bufferPool{pool: sync.Pool{New: func() any { return make([]byte, 32*1024) }}},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				http.Error(rw, "gateway timeout", http.StatusGatewayTimeout)
@@ -75,9 +80,17 @@ func NewHandler(rt *router.Router, poolLookup PoolLookup, aesKey []byte) *Handle
 			}
 		},
 	}
-	h.proxy = rp
+	h.proxy = h2c.NewHandler(rp, &http2.Server{})
 	return h
 }
+
+// bufferPool implements httputil.BufferPool using sync.Pool.
+type bufferPool struct {
+	pool sync.Pool
+}
+
+func (bp *bufferPool) Get() []byte  { return bp.pool.Get().([]byte) }
+func (bp *bufferPool) Put(b []byte) { bp.pool.Put(b) }
 
 func (h *Handler) dialWorkConn(ctx context.Context) (net.Conn, error) {
 	cfg := ctx.Value(routeCtxKey{}).(*router.RouteConfig)
