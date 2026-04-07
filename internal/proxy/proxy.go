@@ -175,9 +175,10 @@ func (h *Handler) handleUpgrade(w http.ResponseWriter, resp *http.Response) {
 		done <- struct{}{}
 	}()
 	<-done
-
+	// 한쪽이 끝나면 양쪽 모두 닫아서 다른 goroutine도 종료시킴
 	clientConn.Close()
 	backend.Close()
+	<-done
 }
 
 // connTransport is an http.RoundTripper that uses a pre-established connection.

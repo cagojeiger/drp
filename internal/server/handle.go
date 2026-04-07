@@ -28,39 +28,44 @@ type Handler struct {
 	controls         controlManager
 }
 
+// controlEntry holds the cancel function and writer for a single control session.
+type controlEntry struct {
+	cancel context.CancelFunc
+	writer io.Writer
+}
+
 // controlManager tracks active controls by runID for reconnect handling.
 type controlManager struct {
-	mu       sync.Mutex
-	sessions map[string]context.CancelFunc
-	writers  map[string]io.Writer
+	mu      sync.Mutex
+	entries map[string]*controlEntry
 }
 
 func (cm *controlManager) Register(runID string, cancel context.CancelFunc, w io.Writer) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	if cm.sessions == nil {
-		cm.sessions = make(map[string]context.CancelFunc)
-		cm.writers = make(map[string]io.Writer)
+	if cm.entries == nil {
+		cm.entries = make(map[string]*controlEntry)
 	}
-	if oldCancel, ok := cm.sessions[runID]; ok {
-		oldCancel()
+	if old, ok := cm.entries[runID]; ok {
+		old.cancel()
 	}
-	cm.sessions[runID] = cancel
-	cm.writers[runID] = w
+	cm.entries[runID] = &controlEntry{cancel: cancel, writer: w}
 }
 
 func (cm *controlManager) Remove(runID string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	delete(cm.sessions, runID)
-	delete(cm.writers, runID)
+	delete(cm.entries, runID)
 }
 
 func (cm *controlManager) GetWriter(runID string) (io.Writer, bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	w, ok := cm.writers[runID]
-	return w, ok
+	e, ok := cm.entries[runID]
+	if !ok {
+		return nil, false
+	}
+	return e.writer, true
 }
 
 // ReqWorkConnFunc returns a function that sends ReqWorkConn on the control channel for the given runID.
@@ -154,13 +159,13 @@ func (h *Handler) handleLogin(conn net.Conn, login *msg.Login) {
 	h.controls.Register(runID, cancel, encWriter)
 
 	// 제어 루프: 암호화된 메시지 수신 → 처리
-	registeredProxies := []string{}
-	h.controlLoop(ctx, conn, encReader, encWriter, runID, &registeredProxies)
+	registeredProxies := make(map[string]struct{})
+	h.controlLoop(ctx, conn, encReader, encWriter, runID, registeredProxies)
 
 	// 연결 종료 시 정리
 	h.controls.Remove(runID)
 	if h.Router != nil {
-		for _, name := range registeredProxies {
+		for name := range registeredProxies {
 			h.Router.Remove(name)
 		}
 	}
@@ -169,7 +174,7 @@ func (h *Handler) handleLogin(conn net.Conn, login *msg.Login) {
 	}
 }
 
-func (h *Handler) controlLoop(ctx context.Context, conn net.Conn, r io.Reader, w io.Writer, runID string, registeredProxies *[]string) {
+func (h *Handler) controlLoop(ctx context.Context, conn net.Conn, r io.Reader, w io.Writer, runID string, registeredProxies map[string]struct{}) {
 	defer conn.Close()
 
 	// context 취소 시 conn을 닫아서 ReadMsg를 unblock
@@ -210,20 +215,14 @@ func (h *Handler) controlLoop(ctx context.Context, conn net.Conn, r io.Reader, w
 			if h.Router != nil {
 				h.Router.Remove(m.ProxyName)
 			}
-			// registeredProxies에서도 제거
-			for i, name := range *registeredProxies {
-				if name == m.ProxyName {
-					*registeredProxies = append((*registeredProxies)[:i], (*registeredProxies)[i+1:]...)
-					break
-				}
-			}
+			delete(registeredProxies, m.ProxyName)
 		default:
 			log.Printf("unexpected control message: %T", rawMsg)
 		}
 	}
 }
 
-func (h *Handler) handleNewProxy(w io.Writer, m *msg.NewProxy, runID string, registeredProxies *[]string) {
+func (h *Handler) handleNewProxy(w io.Writer, m *msg.NewProxy, runID string, registeredProxies map[string]struct{}) {
 	if m.ProxyType != "http" {
 		_ = msg.WriteMsg(w, &msg.NewProxyResp{
 			ProxyName: m.ProxyName,
@@ -281,7 +280,7 @@ func (h *Handler) handleNewProxy(w io.Writer, m *msg.NewProxy, runID string, reg
 			}
 			registered = append(registered, m.ProxyName)
 		}
-		*registeredProxies = append(*registeredProxies, m.ProxyName)
+		registeredProxies[m.ProxyName] = struct{}{}
 	}
 
 	_ = msg.WriteMsg(w, &msg.NewProxyResp{
