@@ -3,7 +3,7 @@
 ## TCP + yamux
 
 ```
-frpc → TCP :17000 → drps
+frpc → TCP :frpcAddr → drps
 drps: yamux.Server(conn, cfg) → 세션 생성
 ```
 
@@ -17,7 +17,7 @@ drps: yamux.Server(conn, cfg) → 세션 생성
 frpc → Login (평문) {version, user, privilege_key, timestamp, run_id, pool_count}
 drps → 인증 검증
 drps → LoginResp (평문) {version, run_id}
-drps → AES 래핑 시작 (이후 모든 제어 메시지 암호화)
+drps → AES 래핑 시작 (캐시된 키 사용, 이후 모든 제어 메시지 암호화)
 drps → ReqWorkConn × PoolCount
 ```
 

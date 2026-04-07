@@ -1,6 +1,6 @@
 # 라우팅 테스트
 
-`internal/router` 대상. 10개.
+`internal/router` 대상. 10개 (변경 없음).
 
 ## 기본 CRUD (4)
 
@@ -26,3 +26,8 @@
 | R-07 | TestLongestPrefixMatch | P0 | /api/v2 > /api > / |
 | R-08 | TestWildcardDomain | P1 | *.example.com 매칭 규칙 |
 | R-09 | TestExactDomainPriority | P1 | 정확한 도메인이 와일드카드보다 우선 |
+
+## RangeByProxy 제거
+
+기존 `RangeByProxy` 메서드는 삭제. 관련 테스트도 제거 대상.
+Lookup 결과에 RunID가 포함되므로 역방향 조회 불필요.

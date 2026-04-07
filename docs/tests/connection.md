@@ -1,6 +1,6 @@
 # 연결 테스트
 
-`internal/server` 대상. 26개.
+`internal/server` 대상. 26개 + 추가 2개.
 
 ## 연결 핸들링 (5)
 
@@ -20,7 +20,7 @@ Login 후 AES 래핑된 제어 메시지 처리.
 
 | ID | 테스트 | 중요도 | 검증 |
 |----|--------|--------|------|
-| S-06 | TestControlReqWorkConn | P0 | Login 후 ReqWorkConn × PoolCount 전송 |
+| S-06 | TestControlReqWorkConn | P0 | Login 후 ReqWorkConn x PoolCount 전송 |
 | S-07 | TestControlPingPong | P0 | Ping → Pong (암호화 경로) |
 | S-08 | TestControlNewProxy | P0 | NewProxy → NewProxyResp(Error="") |
 | S-09 | TestControlNewProxyRejectNonHTTP | P0 | type=tcp → 거부 |
@@ -83,3 +83,12 @@ server → router 통합.
 | ID | 테스트 | 중요도 | 검증 |
 |----|--------|--------|------|
 | S-26 | TestEagerRefill | P0 | Pool.Get 후 제어 채널로 ReqWorkConn 전송 |
+
+## registeredProxies 구조 (추가 2개)
+
+`[]string` → `map[string]struct{}` 변경 검증.
+
+| ID | 테스트 | 중요도 | 검증 |
+|----|--------|--------|------|
+| S-27 | TestCloseProxyMapRemoval | P0 | CloseProxy → map에서 O(1) 제거 확인 |
+| S-28 | TestMultipleCloseProxyIdempotent | P1 | 같은 proxyName 두 번 CloseProxy → 에러 없음 |

@@ -3,22 +3,33 @@
 ## 요청 처리 흐름
 
 ```
-클라이언트 → HTTP :18080 → drps
-  1. Router.Lookup(Host, Path) → RouteConfig
+클라이언트 → HTTP :httpAddr → drps
+  1. Router.Lookup(Host, Path) → RouteConfig (RunID 포함)
   2. Basic Auth 검증 (HTTPUser 설정 시)
-  3. Pool.Get() → 워크 커넥션 획득
-  4. wrap.Wrap() → StartWorkConn + 암호화/압축
-  5. Custom Headers 주입
-  6. HostHeaderRewrite 적용
-  7. req.Write → frpc → 백엔드
-  8. http.ReadResponse → 클라이언트에 전달
-  9. Response Headers 주입
-  10. 워크 커넥션 닫기 + eager refill
+  3. poolLookup(cfg.RunID) → Pool 직접 획득 (이중 조회 없음)
+  4. Pool.Get() → 워크 커넥션 획득
+  5. wrap.Wrap(conn, cachedKey, ...) → StartWorkConn + 암호화/압축 (캐시된 키)
+  6. Custom Headers 주입
+  7. HostHeaderRewrite 적용
+  8. req.Write → frpc → 백엔드
+  9. http.ReadResponse → 클라이언트에 전달 (bufio sync.Pool 재사용)
+  10. Response Headers 주입
+  11. 워크 커넥션 닫기 + eager refill
 ```
+
+### 이전 대비 변경점
+
+| 항목 | 이전 | 이후 |
+|------|------|------|
+| Pool 조회 | poolLookup(proxyName) → RangeByProxy O(N) → runID → Get | poolLookup(cfg.RunID) → Get O(1) |
+| AES 키 | 매 요청 DeriveKey(token) PBKDF2 계산 | 서버 시작 시 1회 계산, 캐시 전달 |
+| bufio.Reader | 매 요청 새로 할당 | sync.Pool 재사용 |
+| WriteMsg | 3회 Write (3 syscall) | 1회 Write (1 syscall) |
 
 ## 워크 커넥션 풀
 
 - RunID 기반 풀 관리 (하나의 frpc = 하나의 풀)
+- capacity: 설정 가능 (기본 64)
 - **Get**: 즉시 시도 → 없으면 ReqWorkConn 전송 → 대기 → 타임아웃
 - **eager refill**: Get 성공 후 비동기로 ReqWorkConn 전송
 
@@ -28,7 +39,7 @@
 
 ```
 StartWorkConn {proxy_name} → 평문으로 전송
-이후 UseEncryption → AES 래핑
+이후 UseEncryption → AES 래핑 (캐시된 키 사용)
 이후 UseCompression → snappy 래핑
 이후 HTTP 바이트 교환
 ```
@@ -64,10 +75,12 @@ RouteConfig.HTTPUser가 설정된 경우:
 drps → 워크 커넥션으로 전달 → frpc → 백엔드
 백엔드 → 101 Switching Protocols
 drps → Hijack → 양방향 raw byte relay
+양쪽 goroutine 모두 완료 대기 후 정리
 ```
 
 - 101 응답 감지 → 클라이언트 연결을 Hijack
 - 이후 양방향 io.Copy (drps는 바이트를 그대로 전달)
+- 양쪽 relay goroutine이 모두 종료된 후 연결 닫기 (goroutine leak 방지)
 
 ## 에러 처리
 
