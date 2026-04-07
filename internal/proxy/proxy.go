@@ -1,12 +1,12 @@
 package proxy
 
 import (
-	"bufio"
+	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"time"
 
 	"github.com/kangheeyong/drp/internal/pool"
@@ -16,6 +16,9 @@ import (
 
 const workConnTimeout = 10 * time.Second
 
+// routeCtxKey is the context key for RouteConfig.
+type routeCtxKey struct{}
+
 // PoolLookup returns the work connection pool for a run ID.
 type PoolLookup func(runID string) (*pool.Pool, bool)
 
@@ -24,29 +27,91 @@ type Handler struct {
 	router          *router.Router
 	poolLookup      PoolLookup
 	aesKey          []byte
+	proxy           http.Handler
 	WorkConnTimeout time.Duration
 	ResponseTimeout time.Duration
 }
 
 func NewHandler(rt *router.Router, poolLookup PoolLookup, aesKey []byte) *Handler {
-	return &Handler{
+	h := &Handler{
 		router:          rt,
 		poolLookup:      poolLookup,
 		aesKey:          aesKey,
 		WorkConnTimeout: workConnTimeout,
 	}
+
+	rp := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			cfg := r.In.Context().Value(routeCtxKey{}).(*router.RouteConfig)
+			r.Out.URL.Scheme = "http"
+			r.Out.URL.Host = r.In.Host
+			if cfg.HostHeaderRewrite != "" {
+				r.Out.Host = cfg.HostHeaderRewrite
+			}
+			for k, v := range cfg.Headers {
+				r.Out.Header.Set(k, v)
+			}
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			cfg := resp.Request.Context().Value(routeCtxKey{}).(*router.RouteConfig)
+			for k, v := range cfg.ResponseHeaders {
+				resp.Header.Set(k, v)
+			}
+			return nil
+		},
+		Transport: &http.Transport{
+			IdleConnTimeout:     60 * time.Second,
+			MaxIdleConnsPerHost: 5,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return h.dialWorkConn(ctx)
+			},
+		},
+		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				http.Error(rw, "gateway timeout", http.StatusGatewayTimeout)
+			} else {
+				log.Printf("proxy: error: %v", err)
+				http.Error(rw, "bad gateway", http.StatusBadGateway)
+			}
+		},
+	}
+	h.proxy = rp
+	return h
+}
+
+func (h *Handler) dialWorkConn(ctx context.Context) (net.Conn, error) {
+	cfg := ctx.Value(routeCtxKey{}).(*router.RouteConfig)
+
+	p, ok := h.poolLookup(cfg.RunID)
+	if !ok {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: fmt.Errorf("pool not found for %s", cfg.RunID)}
+	}
+
+	workConn, err := p.Get(h.WorkConnTimeout)
+	if err != nil {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: err}
+	}
+
+	wrapped, err := wrap.Wrap(workConn, h.aesKey, cfg.ProxyName, cfg.UseEncryption, cfg.UseCompression)
+	if err != nil {
+		workConn.Close()
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: err}
+	}
+
+	if h.ResponseTimeout > 0 {
+		wrapped.SetDeadline(time.Now().Add(h.ResponseTimeout))
+	}
+
+	return wrapped, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 1. 라우팅
 	cfg, ok := h.router.Lookup(r.Host, r.URL.Path)
 	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	log.Printf("proxy: %s%s → proxy=%s runID=%s", r.Host, r.URL.Path, cfg.ProxyName, cfg.RunID)
 
-	// 2. Basic Auth 검증
 	if cfg.HTTPUser != "" {
 		user, pass, ok := r.BasicAuth()
 		if !ok || user != cfg.HTTPUser || pass != cfg.HTTPPwd {
@@ -56,188 +121,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 3. 워크 커넥션 획득
-	p, ok := h.poolLookup(cfg.RunID)
-	if !ok {
-		log.Printf("proxy: pool not found for %s", cfg.RunID)
-		http.Error(w, "upstream unavailable", http.StatusBadGateway)
-		return
-	}
-
-	log.Printf("proxy: getting work conn for %s", cfg.ProxyName)
-	workConn, err := p.Get(h.WorkConnTimeout)
-	if err != nil {
-		log.Printf("proxy: get work conn failed: %v", err)
-		http.Error(w, "upstream unavailable", http.StatusBadGateway)
-		return
-	}
-	log.Printf("proxy: got work conn, wrapping enc=%v comp=%v", cfg.UseEncryption, cfg.UseCompression)
-
-	// 3. StartWorkConn + 암호화/압축 래핑
-	wrapped, err := wrap.Wrap(workConn, h.aesKey, cfg.ProxyName, cfg.UseEncryption, cfg.UseCompression)
-	if err != nil {
-		log.Printf("proxy: wrap failed: %v", err)
-		workConn.Close()
-		http.Error(w, "upstream unavailable", http.StatusBadGateway)
-		return
-	}
-	log.Printf("proxy: wrap done, forwarding request")
-
-	// 5. HostHeaderRewrite
-	if cfg.HostHeaderRewrite != "" {
-		r.Host = cfg.HostHeaderRewrite
-	}
-
-	// 6. Custom request headers
-	for k, v := range cfg.Headers {
-		r.Header.Set(k, v)
-	}
-
-	// 5. Response timeout
-	if h.ResponseTimeout > 0 {
-		if nc, ok := workConn.(net.Conn); ok {
-			nc.SetDeadline(time.Now().Add(h.ResponseTimeout))
-		}
-	}
-
-	// 6. Forward request and relay response
-	transport := &connTransport{conn: wrapped}
-	outReq := r.Clone(r.Context())
-	outReq.RequestURI = ""
-	if outReq.URL.Scheme == "" {
-		outReq.URL.Scheme = "http"
-	}
-	if outReq.URL.Host == "" {
-		outReq.URL.Host = r.Host
-	}
-
-	resp, err := transport.RoundTrip(outReq)
-	if err != nil {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
-		} else {
-			log.Printf("proxy: roundtrip error: %v", err)
-			http.Error(w, "bad gateway", http.StatusBadGateway)
-		}
-		return
-	}
-
-	// WebSocket 101: hijack and bidirectional relay
-	if resp.StatusCode == http.StatusSwitchingProtocols {
-		h.handleUpgrade(w, resp)
-		return
-	}
-
-	// Copy response headers
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	// Custom response headers
-	for k, v := range cfg.ResponseHeaders {
-		w.Header().Set(k, v)
-	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-	resp.Body.Close()
-}
-
-func (h *Handler) handleUpgrade(w http.ResponseWriter, resp *http.Response) {
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "websocket not supported", http.StatusInternalServerError)
-		resp.Body.Close()
-		return
-	}
-
-	clientConn, clientBuf, err := hj.Hijack()
-	if err != nil {
-		resp.Body.Close()
-		return
-	}
-
-	// Write 101 response header to client (without body)
-	fmt.Fprintf(clientBuf, "HTTP/%d.%d %d %s\r\n", resp.ProtoMajor, resp.ProtoMinor, resp.StatusCode, http.StatusText(resp.StatusCode))
-	resp.Header.Write(clientBuf)
-	clientBuf.WriteString("\r\n")
-	clientBuf.Flush()
-
-	// Bidirectional relay between client and backend
-	backend := resp.Body.(io.ReadWriteCloser)
-	done := make(chan struct{}, 2)
-	go func() {
-		io.Copy(backend, clientConn)
-		done <- struct{}{}
-	}()
-	go func() {
-		io.Copy(clientConn, backend)
-		done <- struct{}{}
-	}()
-	<-done
-	// 한쪽이 끝나면 양쪽 모두 닫아서 다른 goroutine도 종료시킴
-	clientConn.Close()
-	backend.Close()
-	<-done
-}
-
-// connTransport is an http.RoundTripper that uses a pre-established connection.
-type connTransport struct {
-	conn interface {
-		Read([]byte) (int, error)
-		Write([]byte) (int, error)
-		Close() error
-	}
-}
-
-func (t *connTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := req.Write(t.conn); err != nil {
-		t.conn.Close()
-		return nil, err
-	}
-
-	br := bufio.NewReader(t.conn)
-	resp, err := http.ReadResponse(br, req)
-	if err != nil {
-		t.conn.Close()
-		return nil, err
-	}
-
-	// 101 Switching Protocols: bufio에 남은 데이터가 있으면 합치고, 없으면 conn 직접 사용
-	var r io.Reader
-	if br.Buffered() > 0 {
-		r = io.MultiReader(br, t.conn)
-	} else {
-		r = t.conn
-	}
-	resp.Body = &connClosingBody{
-		ReadCloser: &readCloser{Reader: r, Closer: resp.Body},
-		conn:       t.conn,
-	}
-	return resp, nil
-}
-
-type readCloser struct {
-	io.Reader
-	io.Closer
-}
-
-// connClosingBody closes the underlying connection when the body is closed.
-// Implements io.ReadWriteCloser so httputil.ReverseProxy can handle 101 Switching Protocols.
-type connClosingBody struct {
-	io.ReadCloser
-	conn interface {
-		io.Writer
-		io.Closer
-	}
-}
-
-func (b *connClosingBody) Write(p []byte) (int, error) {
-	return b.conn.Write(p)
-}
-
-func (b *connClosingBody) Close() error {
-	err := b.ReadCloser.Close()
-	b.conn.Close()
-	return err
+	ctx := context.WithValue(r.Context(), routeCtxKey{}, cfg)
+	h.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
