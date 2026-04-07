@@ -16,7 +16,7 @@ func TestWrapStartWorkConn(t *testing.T) {
 	defer frpcConn.Close()
 
 	go func() {
-		_, err := Wrap(drpsConn, "test-token", "web", false, false)
+		_, err := Wrap(drpsConn, crypto.DeriveKey("test-token"), "web", false, false)
 		if err != nil {
 			t.Errorf("Wrap: %v", err)
 		}
@@ -44,7 +44,7 @@ func TestWrapNoEncNoComp(t *testing.T) {
 	var wrapped io.ReadWriteCloser
 	go func() {
 		var err error
-		wrapped, err = Wrap(drpsConn, "test-token", "web", false, false)
+		wrapped, err = Wrap(drpsConn, crypto.DeriveKey("test-token"), "web", false, false)
 		if err != nil {
 			return
 		}
@@ -73,7 +73,7 @@ func TestWrapEncryption(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		wrapped, err := Wrap(drpsConn, "test-token", "web", true, false)
+		wrapped, err := Wrap(drpsConn, crypto.DeriveKey("test-token"), "web", true, false)
 		if err != nil {
 			return
 		}
@@ -113,7 +113,7 @@ func TestWrapCompression(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		wrapped, err := Wrap(drpsConn, "test-token", "web", false, true)
+		wrapped, err := Wrap(drpsConn, crypto.DeriveKey("test-token"), "web", false, true)
 		if err != nil {
 			return
 		}
@@ -144,7 +144,7 @@ func TestWrapEncAndComp(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		wrapped, err := Wrap(drpsConn, "test-token", "web", true, true)
+		wrapped, err := Wrap(drpsConn, crypto.DeriveKey("test-token"), "web", true, true)
 		if err != nil {
 			return
 		}

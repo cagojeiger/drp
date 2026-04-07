@@ -16,23 +16,23 @@ import (
 
 const workConnTimeout = 10 * time.Second
 
-// PoolLookup returns the work connection pool for a proxy name.
-type PoolLookup func(proxyName string) (*pool.Pool, bool)
+// PoolLookup returns the work connection pool for a run ID.
+type PoolLookup func(runID string) (*pool.Pool, bool)
 
 // Handler is the HTTP handler that proxies requests through frpc work connections.
 type Handler struct {
 	router          *router.Router
 	poolLookup      PoolLookup
-	token           string
+	aesKey          []byte
 	WorkConnTimeout time.Duration
 	ResponseTimeout time.Duration
 }
 
-func NewHandler(rt *router.Router, poolLookup PoolLookup, token string) *Handler {
+func NewHandler(rt *router.Router, poolLookup PoolLookup, aesKey []byte) *Handler {
 	return &Handler{
 		router:          rt,
 		poolLookup:      poolLookup,
-		token:           token,
+		aesKey:          aesKey,
 		WorkConnTimeout: workConnTimeout,
 	}
 }
@@ -57,9 +57,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. 워크 커넥션 획득
-	p, ok := h.poolLookup(cfg.ProxyName)
+	p, ok := h.poolLookup(cfg.RunID)
 	if !ok {
-		log.Printf("proxy: pool not found for %s", cfg.ProxyName)
+		log.Printf("proxy: pool not found for %s", cfg.RunID)
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 		return
 	}
@@ -74,7 +74,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("proxy: got work conn, wrapping enc=%v comp=%v", cfg.UseEncryption, cfg.UseCompression)
 
 	// 3. StartWorkConn + 암호화/압축 래핑
-	wrapped, err := wrap.Wrap(workConn, h.token, cfg.ProxyName, cfg.UseEncryption, cfg.UseCompression)
+	wrapped, err := wrap.Wrap(workConn, h.aesKey, cfg.ProxyName, cfg.UseEncryption, cfg.UseCompression)
 	if err != nil {
 		log.Printf("proxy: wrap failed: %v", err)
 		workConn.Close()

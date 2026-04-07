@@ -28,7 +28,7 @@ func TestCustomRequestHeaders(t *testing.T) {
 		Headers:   map[string]string{"X-Custom": "hello", "X-Env": "prod"},
 	})
 
-	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return p, true }, "test-token")
+	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return p, true }, testAESKey)
 
 	receivedHeaders := make(chan http.Header, 1)
 	go func() {
@@ -72,7 +72,7 @@ func TestResponseHeaders(t *testing.T) {
 		ResponseHeaders: map[string]string{"X-Resp-Custom": "world"},
 	})
 
-	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return p, true }, "test-token")
+	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return p, true }, testAESKey)
 
 	go fakeFrpc(t, frpcConn, "ok")
 
@@ -100,7 +100,7 @@ func TestBasicAuthSuccess(t *testing.T) {
 		HTTPPwd:   "secret",
 	})
 
-	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return p, true }, "test-token")
+	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return p, true }, testAESKey)
 
 	go fakeFrpc(t, frpcConn, "authenticated")
 
@@ -126,7 +126,7 @@ func TestBasicAuthFail(t *testing.T) {
 		HTTPPwd:   "secret",
 	})
 
-	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return nil, false }, "test-token")
+	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return nil, false }, testAESKey)
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Host = "auth.test"
@@ -150,7 +150,7 @@ func TestBasicAuthMissing(t *testing.T) {
 		HTTPPwd:   "secret",
 	})
 
-	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return nil, false }, "test-token")
+	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return nil, false }, testAESKey)
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Host = "auth.test"

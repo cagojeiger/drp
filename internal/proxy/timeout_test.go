@@ -26,7 +26,7 @@ func TestProxyTimeout(t *testing.T) {
 
 	h := NewHandler(rt, func(name string) (*pool.Pool, bool) {
 		return p, true
-	}, "test-token")
+	}, testAESKey)
 	h.ResponseTimeout = 200 * time.Millisecond
 
 	// frpc: StartWorkConn 읽고 → 요청 읽고 → 응답 안 보냄 (슬로우 백엔드)
@@ -66,7 +66,7 @@ func TestProxyNoTimeout(t *testing.T) {
 
 	h := NewHandler(rt, func(name string) (*pool.Pool, bool) {
 		return p, true
-	}, "test-token")
+	}, testAESKey)
 	h.ResponseTimeout = 5 * time.Second
 
 	go fakeFrpc(t, frpcConn, "fast response")

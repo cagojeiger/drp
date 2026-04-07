@@ -7,6 +7,8 @@ import (
 	"io"
 )
 
+const headerSize = 9 // 1 byte type + 8 bytes length
+
 const MaxBodySize = 10240
 
 // Message is the interface all frp protocol messages implement.
@@ -41,8 +43,30 @@ func init() {
 
 // TypeOf returns the wire type byte for a message.
 func TypeOf(m Message) (byte, bool) {
-	b, ok := msgToType[fmt.Sprintf("%T", m)]
-	return b, ok
+	switch m.(type) {
+	case *Login:
+		return 'o', true
+	case *LoginResp:
+		return '1', true
+	case *NewProxy:
+		return 'p', true
+	case *NewProxyResp:
+		return '2', true
+	case *CloseProxy:
+		return 'c', true
+	case *ReqWorkConn:
+		return 'r', true
+	case *NewWorkConn:
+		return 'w', true
+	case *StartWorkConn:
+		return 's', true
+	case *Ping:
+		return 'h', true
+	case *Pong:
+		return '4', true
+	default:
+		return 0, false
+	}
 }
 
 // WriteMsg writes a message in frp wire format: [1B type][8B length BE][JSON]
@@ -57,13 +81,11 @@ func WriteMsg(w io.Writer, m Message) error {
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	if _, err := w.Write([]byte{typeByte}); err != nil {
-		return err
-	}
-	if err := binary.Write(w, binary.BigEndian, int64(len(body))); err != nil {
-		return err
-	}
-	_, err = w.Write(body)
+	buf := make([]byte, headerSize+len(body))
+	buf[0] = typeByte
+	binary.BigEndian.PutUint64(buf[1:headerSize], uint64(len(body)))
+	copy(buf[headerSize:], body)
+	_, err = w.Write(buf)
 	return err
 }
 
@@ -78,8 +100,8 @@ func ReadMsg(r io.Reader) (Message, error) {
 	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
 		return nil, err
 	}
-	if length > MaxBodySize {
-		return nil, fmt.Errorf("message body too large: %d > %d", length, MaxBodySize)
+	if length < 0 || length > MaxBodySize {
+		return nil, fmt.Errorf("invalid message body size: %d (max %d)", length, MaxBodySize)
 	}
 
 	fn, ok := typeTo[typeBuf[0]]

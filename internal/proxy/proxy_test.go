@@ -11,10 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kangheeyong/drp/internal/crypto"
 	"github.com/kangheeyong/drp/internal/msg"
 	"github.com/kangheeyong/drp/internal/pool"
 	"github.com/kangheeyong/drp/internal/router"
 )
+
+var testAESKey = crypto.DeriveKey("test-token")
 
 // fakeFrpc: pipe 반대쪽에서 StartWorkConn 읽고 → HTTP 요청 읽고 → HTTP 응답 쓰기
 func fakeFrpc(t *testing.T, conn net.Conn, responseBody string) {
@@ -65,14 +68,15 @@ func setupTestProxy(t *testing.T) (*Handler, *router.Router, *pool.Pool, net.Con
 		Domain:    "test.local",
 		Location:  "/",
 		ProxyName: "web",
+		RunID:     "run-1",
 	})
 
-	h := NewHandler(rt, func(proxyName string) (*pool.Pool, bool) {
-		if proxyName == "web" {
+	h := NewHandler(rt, func(runID string) (*pool.Pool, bool) {
+		if runID == "run-1" {
 			return p, true
 		}
 		return nil, false
-	}, "test-token")
+	}, testAESKey)
 
 	return h, rt, p, frpcConn
 }
@@ -100,7 +104,7 @@ func TestProxyBasicRequest(t *testing.T) {
 
 func TestProxyNotFound(t *testing.T) {
 	rt := router.New()
-	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return nil, false }, "test-token")
+	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return nil, false }, testAESKey)
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Host = "unknown.com"
@@ -124,7 +128,7 @@ func TestProxyNoWorkConn(t *testing.T) {
 	emptyPool := pool.New(func() {})
 	h := NewHandler(rt, func(string) (*pool.Pool, bool) {
 		return emptyPool, true
-	}, "test-token")
+	}, testAESKey)
 	h.WorkConnTimeout = 100 * time.Millisecond
 
 	req := httptest.NewRequest("GET", "/", nil)
@@ -152,7 +156,7 @@ func TestProxyHostHeaderRewrite(t *testing.T) {
 		HostHeaderRewrite: "internal.local",
 	})
 
-	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return p, true }, "test-token")
+	h := NewHandler(rt, func(string) (*pool.Pool, bool) { return p, true }, testAESKey)
 
 	receivedHost := make(chan string, 1)
 	go func() {
@@ -185,8 +189,8 @@ func TestProxyHostHeaderRewrite(t *testing.T) {
 
 func TestProxyMultipleDomains(t *testing.T) {
 	rt := router.New()
-	rt.Add(&router.RouteConfig{Domain: "a.com", Location: "/", ProxyName: "proxyA"})
-	rt.Add(&router.RouteConfig{Domain: "b.com", Location: "/", ProxyName: "proxyB"})
+	rt.Add(&router.RouteConfig{Domain: "a.com", Location: "/", ProxyName: "proxyA", RunID: "run-a"})
+	rt.Add(&router.RouteConfig{Domain: "b.com", Location: "/", ProxyName: "proxyB", RunID: "run-b"})
 
 	poolA := pool.New(func() {})
 	poolB := pool.New(func() {})
@@ -196,15 +200,15 @@ func TestProxyMultipleDomains(t *testing.T) {
 	poolA.Put(connA1)
 	poolB.Put(connB1)
 
-	h := NewHandler(rt, func(name string) (*pool.Pool, bool) {
-		switch name {
-		case "proxyA":
+	h := NewHandler(rt, func(runID string) (*pool.Pool, bool) {
+		switch runID {
+		case "run-a":
 			return poolA, true
-		case "proxyB":
+		case "run-b":
 			return poolB, true
 		}
 		return nil, false
-	}, "test-token")
+	}, testAESKey)
 
 	go fakeFrpc(t, frpcA, "from A")
 	go fakeFrpc(t, frpcB, "from B")

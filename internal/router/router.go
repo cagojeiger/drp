@@ -107,29 +107,6 @@ func (r *Router) Lookup(domain, path string) (*RouteConfig, bool) {
 	return nil, false
 }
 
-// RangeByProxy calls fn for the first RouteConfig with the given proxyName.
-func (r *Router) RangeByProxy(proxyName string, fn func(cfg *RouteConfig)) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	for _, routes := range r.exact {
-		for _, rc := range routes {
-			if rc.ProxyName == proxyName {
-				fn(rc)
-				return
-			}
-		}
-	}
-	for _, routes := range r.wildcard {
-		for _, rc := range routes {
-			if rc.ProxyName == proxyName {
-				fn(rc)
-				return
-			}
-		}
-	}
-}
-
 // matchRoutes finds the longest prefix match among routes.
 func (r *Router) matchRoutes(routes []*RouteConfig, path string) (*RouteConfig, bool) {
 	if len(routes) == 0 {

@@ -13,7 +13,7 @@ import (
 //
 // Wire order (both sides must match):
 //   conn → [AES-128-CFB] → [snappy] → HTTP bytes
-func Wrap(conn net.Conn, token, proxyName string, enc, comp bool) (io.ReadWriteCloser, error) {
+func Wrap(conn net.Conn, aesKey []byte, proxyName string, enc, comp bool) (io.ReadWriteCloser, error) {
 	// 1. StartWorkConn (always plaintext)
 	if err := msg.WriteMsg(conn, &msg.StartWorkConn{
 		ProxyName: proxyName,
@@ -27,12 +27,11 @@ func Wrap(conn net.Conn, token, proxyName string, enc, comp bool) (io.ReadWriteC
 
 	// 2. Encryption layer
 	if enc {
-		key := crypto.DeriveKey(token)
-		encWriter, err := crypto.NewCryptoWriter(conn, key)
+		encWriter, err := crypto.NewCryptoWriter(conn, aesKey)
 		if err != nil {
 			return nil, err
 		}
-		encReader, err := crypto.NewCryptoReader(conn, key)
+		encReader, err := crypto.NewCryptoReader(conn, aesKey)
 		if err != nil {
 			return nil, err
 		}
