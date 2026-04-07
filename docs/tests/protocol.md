@@ -1,6 +1,6 @@
 # 프로토콜 테스트
 
-`internal/msg`, `internal/auth`, `internal/crypto` 대상. 26개 + 벤치마크 7개.
+`internal/msg`, `internal/auth`, `internal/crypto` 대상. 27개 + 벤치마크 7개.
 
 ## 와이어 포맷 (6) — internal/msg
 
@@ -19,6 +19,7 @@
 |----|--------|--------|------|
 | M-07 | TestWriteMsgSingleWrite | P0 | WriteMsg가 w.Write를 정확히 1회만 호출하는지 확인 (spy writer) |
 | M-08 | TestTypeByteSwitchConsistency | P0 | switch 기반 TypeOf와 기존 map 결과가 10개 메시지 모두 동일 |
+| M-09 | TestReadMsgRejectNegativeLength | P1 | 음수 length 값 → 에러 반환 (보안) |
 
 ## 인증 (6) — internal/auth
 

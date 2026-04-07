@@ -1,6 +1,6 @@
 # 프록시 테스트
 
-`internal/proxy`, `internal/wrap`, `internal/pool` 대상. 27개 + 추가 7개 + 벤치마크 5개.
+`internal/proxy`, `internal/wrap`, `internal/pool` 대상. 27개 + 추가 6개 + 벤치마크 5개.
 
 ## 워크 커넥션 풀 (6) — internal/pool
 

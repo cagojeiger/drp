@@ -1,6 +1,6 @@
 # 성능 테스트
 
-벤치마크 12개. 리팩토링 전후 비교 및 회귀 방지 목적.
+벤치마크 13개. 리팩토링 전후 비교 및 회귀 방지 목적.
 
 ## 실행
 
@@ -83,12 +83,13 @@ func BenchmarkDeriveKey(b *testing.B) {
 | B-X-03 | BenchmarkWrap | 캐시 키 사용 | DeriveKey 제거 효과 |
 | B-X-04 | BenchmarkConnTransportRoundTrip | bufio sync.Pool 재사용 | allocs/op 감소 |
 
-## pool 벤치마크 (2) — internal/pool
+## pool 벤치마크 (3) — internal/pool
 
 | ID | 벤치마크 | 개선 포인트 | 기대 효과 |
 |----|---------|------------|----------|
 | B-X-02 | BenchmarkPoolGetPut | Get/Put 사이클 | 기준선 |
 | B-X-05 | BenchmarkPoolLookupByRunID | RunID 직접 vs RangeByProxy | O(1) vs O(N) 차이 |
+| B-P-01 | BenchmarkPoolGetEagerRefill | Get 후 eager refill 비용 | goroutine 생성 오버헤드 측정 |
 
 ### B-X-05 검증 방법
 
