@@ -28,20 +28,20 @@ type Handler struct {
 	controls         controlManager
 }
 
-// controlEntry holds the cancel function and writer for a single control session.
-// All writes to the control channel must go through WriteMsg to prevent concurrent
-// write corruption on the AES cipher stream.
+// controlEntry holds the cancel function and send channel for a single control session.
+// All writes to the control channel go through sendCh → sendLoop (single writer).
 type controlEntry struct {
-	cancel  context.CancelFunc
-	writer  io.Writer
-	writeMu sync.Mutex
+	cancel context.CancelFunc
+	sendCh chan msg.Message
 }
 
-// WriteMsg writes a message to the control channel with mutex protection.
-func (ce *controlEntry) WriteMsg(m msg.Message) error {
-	ce.writeMu.Lock()
-	defer ce.writeMu.Unlock()
-	return msg.WriteMsg(ce.writer, m)
+// Send enqueues a message to the control channel's write queue.
+// Non-blocking: drops the message if the queue is full.
+func (ce *controlEntry) Send(m msg.Message) {
+	select {
+	case ce.sendCh <- m:
+	default:
+	}
 }
 
 // controlManager tracks active controls by runID for reconnect handling.
@@ -50,7 +50,7 @@ type controlManager struct {
 	entries map[string]*controlEntry
 }
 
-func (cm *controlManager) Register(runID string, cancel context.CancelFunc, w io.Writer) {
+func (cm *controlManager) Register(runID string, cancel context.CancelFunc, sendCh chan msg.Message) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	if cm.entries == nil {
@@ -59,7 +59,7 @@ func (cm *controlManager) Register(runID string, cancel context.CancelFunc, w io
 	if old, ok := cm.entries[runID]; ok {
 		old.cancel()
 	}
-	cm.entries[runID] = &controlEntry{cancel: cancel, writer: w}
+	cm.entries[runID] = &controlEntry{cancel: cancel, sendCh: sendCh}
 }
 
 func (cm *controlManager) Remove(runID string) {
@@ -76,14 +76,14 @@ func (cm *controlManager) GetEntry(runID string) (*controlEntry, bool) {
 }
 
 // ReqWorkConnFunc returns a function that sends ReqWorkConn on the control channel for the given runID.
-// The write is serialized through controlEntry.WriteMsg to prevent concurrent write corruption.
+// Non-blocking: the message is enqueued to sendCh and written by sendLoop.
 func (h *Handler) ReqWorkConnFunc(runID string) func() {
 	return func() {
 		e, ok := h.controls.GetEntry(runID)
 		if !ok {
 			return
 		}
-		_ = e.WriteMsg(&msg.ReqWorkConn{})
+		e.Send(&msg.ReqWorkConn{})
 	}
 }
 
@@ -154,25 +154,25 @@ func (h *Handler) handleLogin(conn net.Conn, login *msg.Login) {
 		return
 	}
 
+	// 제어 채널 write 큐 + 전용 sendLoop
+	sendCh := make(chan msg.Message, 100)
+	go sendLoop(encWriter, sendCh)
+
+	// ReqWorkConn × PoolCount (sendLoop 시작 후)
+	for range login.PoolCount {
+		sendCh <- &msg.ReqWorkConn{}
+	}
+
 	// 재연결 관리: 같은 RunID가 오면 old를 취소
 	ctx, cancel := context.WithCancel(context.Background())
-	h.controls.Register(runID, cancel, encWriter)
-
-	entry, _ := h.controls.GetEntry(runID)
-
-	// ReqWorkConn × PoolCount
-	for range login.PoolCount {
-		if err := entry.WriteMsg(&msg.ReqWorkConn{}); err != nil {
-			conn.Close()
-			return
-		}
-	}
+	h.controls.Register(runID, cancel, sendCh)
 
 	// 제어 루프: 암호화된 메시지 수신 → 처리
 	registeredProxies := make(map[string]struct{})
-	h.controlLoop(ctx, conn, encReader, entry, runID, registeredProxies)
+	h.controlLoop(ctx, conn, encReader, sendCh, runID, registeredProxies)
 
 	// 연결 종료 시 정리
+	close(sendCh) // sendLoop 종료
 	h.controls.Remove(runID)
 	if h.Router != nil {
 		for name := range registeredProxies {
@@ -184,7 +184,17 @@ func (h *Handler) handleLogin(conn net.Conn, login *msg.Login) {
 	}
 }
 
-func (h *Handler) controlLoop(ctx context.Context, conn net.Conn, r io.Reader, entry *controlEntry, runID string, registeredProxies map[string]struct{}) {
+// sendLoop is the single writer goroutine for the control channel.
+// It drains sendCh and writes messages sequentially to the encrypted writer.
+func sendLoop(w io.Writer, sendCh <-chan msg.Message) {
+	for m := range sendCh {
+		if err := msg.WriteMsg(w, m); err != nil {
+			return
+		}
+	}
+}
+
+func (h *Handler) controlLoop(ctx context.Context, conn net.Conn, r io.Reader, sendCh chan msg.Message, runID string, registeredProxies map[string]struct{}) {
 	defer conn.Close()
 
 	// context 취소 시 conn을 닫아서 ReadMsg를 unblock
@@ -216,11 +226,9 @@ func (h *Handler) controlLoop(ctx context.Context, conn net.Conn, r io.Reader, e
 			if heartbeatTimer != nil {
 				heartbeatTimer.Reset(h.HeartbeatTimeout)
 			}
-			if err := entry.WriteMsg(&msg.Pong{}); err != nil {
-				return
-			}
+			sendCh <- &msg.Pong{}
 		case *msg.NewProxy:
-			h.handleNewProxy(entry, m, runID, registeredProxies)
+			h.handleNewProxy(sendCh, m, runID, registeredProxies)
 		case *msg.CloseProxy:
 			if h.Router != nil {
 				h.Router.Remove(m.ProxyName)
@@ -232,12 +240,12 @@ func (h *Handler) controlLoop(ctx context.Context, conn net.Conn, r io.Reader, e
 	}
 }
 
-func (h *Handler) handleNewProxy(entry *controlEntry, m *msg.NewProxy, runID string, registeredProxies map[string]struct{}) {
+func (h *Handler) handleNewProxy(sendCh chan msg.Message, m *msg.NewProxy, runID string, registeredProxies map[string]struct{}) {
 	if m.ProxyType != "http" {
-		_ = entry.WriteMsg(&msg.NewProxyResp{
+		sendCh <- &msg.NewProxyResp{
 			ProxyName: m.ProxyName,
 			Error:     "only http proxy type is supported",
-		})
+		}
 		return
 	}
 
@@ -270,10 +278,10 @@ func (h *Handler) handleNewProxy(entry *controlEntry, m *msg.NewProxy, runID str
 						for _, name := range registered {
 							h.Router.Remove(name)
 						}
-						_ = entry.WriteMsg(&msg.NewProxyResp{
+						sendCh <- &msg.NewProxyResp{
 							ProxyName: m.ProxyName,
 							Error:     err.Error(),
-						})
+						}
 						return
 					}
 				}
@@ -281,10 +289,10 @@ func (h *Handler) handleNewProxy(entry *controlEntry, m *msg.NewProxy, runID str
 				if err := h.Router.Add(cfg); err != nil {
 					// 롤백
 					h.Router.Remove(m.ProxyName)
-					_ = entry.WriteMsg(&msg.NewProxyResp{
+					sendCh <- &msg.NewProxyResp{
 						ProxyName: m.ProxyName,
 						Error:     err.Error(),
-					})
+					}
 					return
 				}
 			}
@@ -293,8 +301,8 @@ func (h *Handler) handleNewProxy(entry *controlEntry, m *msg.NewProxy, runID str
 		registeredProxies[m.ProxyName] = struct{}{}
 	}
 
-	_ = entry.WriteMsg(&msg.NewProxyResp{
+	sendCh <- &msg.NewProxyResp{
 		ProxyName:  m.ProxyName,
 		RemoteAddr: ":80",
-	})
+	}
 }
