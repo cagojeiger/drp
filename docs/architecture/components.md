@@ -199,6 +199,25 @@ frp v0.68.0 필드 완전 일치. MaxBodySize = 10240.
 
 DeriveKey는 서버 시작 시 1회만 호출. 결과를 proxy.Handler.aesKey에 캐시.
 
+---
+
+## 현재 코드의 성능 병목 요약
+
+HTTP 요청 hot path에서 매 요청마다 발생하는 불필요한 비용:
+
+| 위치 | 코드 | 문제 | 비용 |
+|------|------|------|------|
+| `main.go:39` | poolLookup 클로저 | RangeByProxy O(N) 역방향 조회 (Lookup이 이미 RunID 반환) | O(전체 라우트 수) |
+| `router.go:111` | RangeByProxy | exact+wildcard 전체 순회하여 proxyName→RunID 검색 | O(N) |
+| `router.go:133` | matchRoutes | 정렬 없이 전체 경로 순회하여 longest prefix 검색 | O(도메인별 경로 수) |
+| `wrap.go:30` | Wrap → DeriveKey | 동일 토큰에 대해 매번 PBKDF2 키 파생 | ~50μs CPU |
+| `msg.go:49` | WriteMsg | type/length/body 3번 개별 Write | 3 syscall |
+| `msg.go:43` | TypeOf | fmt.Sprintf("%T") 문자열 할당 | 1+ alloc |
+| `proxy.go:47,67,74,84` | log.Printf | 매 요청 5회 로그 출력 (뮤텍스 + fmt + syscall) | 5 syscall |
+| `proxy.go:198` | bufio.NewReader | 매 RoundTrip 새 4KB 버퍼 할당 | 1 alloc |
+
+이 비용들이 모두 **매 HTTP 요청의 직렬 경로**에 놓여 있어, 개별로는 작아도 누적되면 지연을 증가시킨다.
+
 ## 외부 의존성
 
 | 라이브러리 | 용도 |

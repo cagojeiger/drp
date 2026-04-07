@@ -99,6 +99,56 @@ drps → Hijack → 양방향 raw byte relay
 | WorkConnTimeout | 10초 | 풀에서 워크 커넥션 대기 |
 | ResponseTimeout | 설정 가능 | 백엔드 응답 대기 |
 
+## 성능 주의사항 (현재 코드의 병목)
+
+### 1. poolLookup 이중 조회 — `main.go:39`, `router.go:111`
+
+현재 `ServeHTTP`의 Pool 조회 경로:
+
+```
+Router.Lookup(host, path) → RouteConfig { ProxyName, RunID, ... }
+                                            ↓
+poolLookup(proxyName) → RangeByProxy(proxyName)  ← O(N) 전체 라우트 순회!
+                                            ↓
+                                        runID 획득
+                                            ↓
+                                    registry.Get(runID)
+```
+
+`RangeByProxy` (`router.go:111`)는 exact + wildcard 맵의 모든 라우트를 순회하며 `proxyName`이 일치하는 첫 번째를 찾는다. **Lookup이 이미 RunID를 반환하는데 다시 proxyName→RunID 역방향 조회를 하는 이중 조회 구조.**
+
+프록시 수가 증가하면 매 HTTP 요청마다 선형으로 성능 저하.
+
+### 2. PBKDF2 매 요청 호출 — `wrap.go:30`, `crypto.go:21`
+
+```
+매 HTTP 요청 → wrap.Wrap(conn, token, ...) → crypto.DeriveKey(token)
+                                                ↓
+                                        PBKDF2(SHA1, 64 iter) 실행
+```
+
+동일 토큰에서 항상 같은 키가 나오는데, 매 요청마다 CPU 바운드 키 파생을 반복.
+
+### 3. 매 요청 hot path의 상세 비용
+
+```
+ServeHTTP 1회 호출 시:
+  ├─ Router.Lookup         : RLock + map lookup + matchRoutes 순회 + RUnlock
+  ├─ log.Printf            : 뮤텍스 + fmt + syscall (2회)
+  ├─ poolLookup            : RangeByProxy O(N) + RLock/RUnlock
+  ├─ Pool.Get              : mutex + chan recv + go requestFn()
+  ├─ log.Printf            : 뮤텍스 + fmt + syscall (2회)
+  ├─ wrap.Wrap             : WriteMsg (3 syscall) + DeriveKey (PBKDF2)
+  │                          + rand.Read(IV) + NewCipher + ReadFull(IV)
+  ├─ log.Printf            : 뮤텍스 + fmt + syscall (1회)
+  ├─ r.Clone               : deep copy of *http.Request
+  ├─ req.Write             : 직렬화 + Write
+  ├─ bufio.NewReader(conn) : 4KB 힙 할당
+  └─ http.ReadResponse     : 파싱 + body 읽기
+```
+
+총 5회 log.Printf (각각 뮤텍스 + fmt + 최소 1 syscall), 3회 WriteMsg syscall, 1회 PBKDF2, 1회 RangeByProxy O(N) 순회가 **매 HTTP 요청마다** 발생.
+
 ### 구현
 
 `internal/proxy` — Handler.ServeHTTP, connTransport, handleUpgrade
