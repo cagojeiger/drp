@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/hashicorp/yamux"
+	"github.com/kangheeyong/drp/internal/crypto"
 	"github.com/kangheeyong/drp/internal/msg"
 	"github.com/kangheeyong/drp/internal/pool"
 	"github.com/kangheeyong/drp/internal/proxy"
@@ -21,6 +22,7 @@ func main() {
 
 	rt := router.New()
 	registry := pool.NewRegistry()
+	aesKey := crypto.DeriveKey(token)
 
 	h := &server.Handler{
 		Token:  token,
@@ -36,20 +38,9 @@ func main() {
 		p.Put(conn)
 	}
 
-	proxyHandler := proxy.NewHandler(rt, func(proxyName string) (*pool.Pool, bool) {
-		// RouteConfig에서 RunID를 찾아서 해당 풀 반환
-		// Router.Lookup은 이미 호출됐으므로, 여기서는 RunID로 찾아야 함
-		// 간단한 방법: proxyName 대신 RunID 기반으로 찾기 위해
-		// Router에서 RunID를 가져옴
-		var runID string
-		rt.RangeByProxy(proxyName, func(cfg *router.RouteConfig) {
-			runID = cfg.RunID
-		})
-		if runID == "" {
-			return nil, false
-		}
+	proxyHandler := proxy.NewHandler(rt, func(runID string) (*pool.Pool, bool) {
 		return registry.Get(runID)
-	}, token)
+	}, aesKey)
 
 	// frpc 리스너
 	frpcLn, err := net.Listen("tcp", frpcAddr)

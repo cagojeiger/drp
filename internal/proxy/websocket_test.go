@@ -75,7 +75,7 @@ func TestWebSocketRelay(t *testing.T) {
 
 	h := NewHandler(rt, func(name string) (*pool.Pool, bool) {
 		return p, true
-	}, "test-token")
+	}, testAESKey)
 
 	// 실제 HTTP 서버로 프록시 구동 (Hijack 지원 필요)
 	server := httptest.NewServer(h)

@@ -94,12 +94,13 @@ func TestProxyWithEncryption(t *testing.T) {
 		Domain:        "enc.test",
 		Location:      "/",
 		ProxyName:     "web-enc",
+		RunID:         "run-enc",
 		UseEncryption: true,
 	})
 
-	h := NewHandler(rt, func(name string) (*pool.Pool, bool) {
+	h := NewHandler(rt, func(runID string) (*pool.Pool, bool) {
 		return p, true
-	}, "test-token")
+	}, testAESKey)
 
 	go fakeFrpcEncrypted(t, frpcConn, "test-token", "encrypted response", true, false)
 
@@ -127,12 +128,13 @@ func TestProxyWithCompression(t *testing.T) {
 		Domain:         "comp.test",
 		Location:       "/",
 		ProxyName:      "web-comp",
+		RunID:          "run-comp",
 		UseCompression: true,
 	})
 
-	h := NewHandler(rt, func(name string) (*pool.Pool, bool) {
+	h := NewHandler(rt, func(runID string) (*pool.Pool, bool) {
 		return p, true
-	}, "test-token")
+	}, testAESKey)
 
 	go fakeFrpcEncrypted(t, frpcConn, "test-token", "compressed response", false, true)
 
@@ -160,13 +162,14 @@ func TestProxyWithEncAndComp(t *testing.T) {
 		Domain:         "both.test",
 		Location:       "/",
 		ProxyName:      "web-both",
+		RunID:          "run-both",
 		UseEncryption:  true,
 		UseCompression: true,
 	})
 
-	h := NewHandler(rt, func(name string) (*pool.Pool, bool) {
+	h := NewHandler(rt, func(runID string) (*pool.Pool, bool) {
 		return p, true
-	}, "test-token")
+	}, testAESKey)
 
 	go fakeFrpcEncrypted(t, frpcConn, "test-token", "enc+comp response", true, true)
 
