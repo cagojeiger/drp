@@ -29,9 +29,19 @@ type Handler struct {
 }
 
 // controlEntry holds the cancel function and writer for a single control session.
+// All writes to the control channel must go through WriteMsg to prevent concurrent
+// write corruption on the AES cipher stream.
 type controlEntry struct {
-	cancel context.CancelFunc
-	writer io.Writer
+	cancel  context.CancelFunc
+	writer  io.Writer
+	writeMu sync.Mutex
+}
+
+// WriteMsg writes a message to the control channel with mutex protection.
+func (ce *controlEntry) WriteMsg(m msg.Message) error {
+	ce.writeMu.Lock()
+	defer ce.writeMu.Unlock()
+	return msg.WriteMsg(ce.writer, m)
 }
 
 // controlManager tracks active controls by runID for reconnect handling.
@@ -58,24 +68,22 @@ func (cm *controlManager) Remove(runID string) {
 	delete(cm.entries, runID)
 }
 
-func (cm *controlManager) GetWriter(runID string) (io.Writer, bool) {
+func (cm *controlManager) GetEntry(runID string) (*controlEntry, bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	e, ok := cm.entries[runID]
-	if !ok {
-		return nil, false
-	}
-	return e.writer, true
+	return e, ok
 }
 
 // ReqWorkConnFunc returns a function that sends ReqWorkConn on the control channel for the given runID.
+// The write is serialized through controlEntry.WriteMsg to prevent concurrent write corruption.
 func (h *Handler) ReqWorkConnFunc(runID string) func() {
 	return func() {
-		w, ok := h.controls.GetWriter(runID)
+		e, ok := h.controls.GetEntry(runID)
 		if !ok {
 			return
 		}
-		_ = msg.WriteMsg(w, &msg.ReqWorkConn{})
+		_ = e.WriteMsg(&msg.ReqWorkConn{})
 	}
 }
 
@@ -146,21 +154,23 @@ func (h *Handler) handleLogin(conn net.Conn, login *msg.Login) {
 		return
 	}
 
+	// 재연결 관리: 같은 RunID가 오면 old를 취소
+	ctx, cancel := context.WithCancel(context.Background())
+	h.controls.Register(runID, cancel, encWriter)
+
+	entry, _ := h.controls.GetEntry(runID)
+
 	// ReqWorkConn × PoolCount
 	for range login.PoolCount {
-		if err := msg.WriteMsg(encWriter, &msg.ReqWorkConn{}); err != nil {
+		if err := entry.WriteMsg(&msg.ReqWorkConn{}); err != nil {
 			conn.Close()
 			return
 		}
 	}
 
-	// 재연결 관리: 같은 RunID가 오면 old를 취소
-	ctx, cancel := context.WithCancel(context.Background())
-	h.controls.Register(runID, cancel, encWriter)
-
 	// 제어 루프: 암호화된 메시지 수신 → 처리
 	registeredProxies := make(map[string]struct{})
-	h.controlLoop(ctx, conn, encReader, encWriter, runID, registeredProxies)
+	h.controlLoop(ctx, conn, encReader, entry, runID, registeredProxies)
 
 	// 연결 종료 시 정리
 	h.controls.Remove(runID)
@@ -174,7 +184,7 @@ func (h *Handler) handleLogin(conn net.Conn, login *msg.Login) {
 	}
 }
 
-func (h *Handler) controlLoop(ctx context.Context, conn net.Conn, r io.Reader, w io.Writer, runID string, registeredProxies map[string]struct{}) {
+func (h *Handler) controlLoop(ctx context.Context, conn net.Conn, r io.Reader, entry *controlEntry, runID string, registeredProxies map[string]struct{}) {
 	defer conn.Close()
 
 	// context 취소 시 conn을 닫아서 ReadMsg를 unblock
@@ -206,11 +216,11 @@ func (h *Handler) controlLoop(ctx context.Context, conn net.Conn, r io.Reader, w
 			if heartbeatTimer != nil {
 				heartbeatTimer.Reset(h.HeartbeatTimeout)
 			}
-			if err := msg.WriteMsg(w, &msg.Pong{}); err != nil {
+			if err := entry.WriteMsg(&msg.Pong{}); err != nil {
 				return
 			}
 		case *msg.NewProxy:
-			h.handleNewProxy(w, m, runID, registeredProxies)
+			h.handleNewProxy(entry, m, runID, registeredProxies)
 		case *msg.CloseProxy:
 			if h.Router != nil {
 				h.Router.Remove(m.ProxyName)
@@ -222,9 +232,9 @@ func (h *Handler) controlLoop(ctx context.Context, conn net.Conn, r io.Reader, w
 	}
 }
 
-func (h *Handler) handleNewProxy(w io.Writer, m *msg.NewProxy, runID string, registeredProxies map[string]struct{}) {
+func (h *Handler) handleNewProxy(entry *controlEntry, m *msg.NewProxy, runID string, registeredProxies map[string]struct{}) {
 	if m.ProxyType != "http" {
-		_ = msg.WriteMsg(w, &msg.NewProxyResp{
+		_ = entry.WriteMsg(&msg.NewProxyResp{
 			ProxyName: m.ProxyName,
 			Error:     "only http proxy type is supported",
 		})
@@ -260,7 +270,7 @@ func (h *Handler) handleNewProxy(w io.Writer, m *msg.NewProxy, runID string, reg
 						for _, name := range registered {
 							h.Router.Remove(name)
 						}
-						_ = msg.WriteMsg(w, &msg.NewProxyResp{
+						_ = entry.WriteMsg(&msg.NewProxyResp{
 							ProxyName: m.ProxyName,
 							Error:     err.Error(),
 						})
@@ -271,7 +281,7 @@ func (h *Handler) handleNewProxy(w io.Writer, m *msg.NewProxy, runID string, reg
 				if err := h.Router.Add(cfg); err != nil {
 					// 롤백
 					h.Router.Remove(m.ProxyName)
-					_ = msg.WriteMsg(w, &msg.NewProxyResp{
+					_ = entry.WriteMsg(&msg.NewProxyResp{
 						ProxyName: m.ProxyName,
 						Error:     err.Error(),
 					})
@@ -283,7 +293,7 @@ func (h *Handler) handleNewProxy(w io.Writer, m *msg.NewProxy, runID string, reg
 		registeredProxies[m.ProxyName] = struct{}{}
 	}
 
-	_ = msg.WriteMsg(w, &msg.NewProxyResp{
+	_ = entry.WriteMsg(&msg.NewProxyResp{
 		ProxyName:  m.ProxyName,
 		RemoteAddr: ":80",
 	})
