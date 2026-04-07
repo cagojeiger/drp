@@ -1,6 +1,6 @@
 # E2E 테스트
 
-`test/` 대상. Docker (testcontainers-go) + 실제 frpc v0.68.0. 4개.
+`test/` 대상. Docker (testcontainers-go) + 실제 frpc v0.68.0. 4개 (변경 없음).
 
 ## 환경
 
@@ -25,13 +25,13 @@ testcontainers-go로 Docker 컨테이너 자동 관리:
 
 | 항목 | 단위 테스트 | E2E |
 |------|-----------|-----|
-| 와이어 프로토콜 호환 | ✅ (포맷 검증) | ✅ (실제 frpc 통신) |
-| 인증 | ✅ | ✅ |
-| AES 암호화 | ✅ | ✅ (frpc 기본 제어채널) |
-| yamux 멀티플렉싱 | ✅ (net.Pipe) | ✅ (실제 TCP) |
-| HTTP 프록시 | ✅ (fakeFrpc) | ✅ (실제 frpc + nginx) |
-| 멀티 프록시 | ✅ | ✅ |
-| WebSocket | ✅ (단위) | 로컬 검증 (Go raw client) |
+| 와이어 프로토콜 호환 | O (포맷 검증) | O (실제 frpc 통신) |
+| 인증 | O | O |
+| AES 암호화 | O | O (frpc 기본 제어채널) |
+| yamux 멀티플렉싱 | O (net.Pipe) | O (실제 TCP) |
+| HTTP 프록시 | O (fakeFrpc) | O (실제 frpc + nginx) |
+| 멀티 프록시 | O | O |
+| WebSocket | O (단위) | 로컬 검증 (Go raw client) |
 
 ## 실행
 
@@ -44,4 +44,7 @@ go test github.com/kangheeyong/drp/internal/... -v
 
 # 짧은 모드 (e2e 건너뛰기)
 go test ./test/ -short
+
+# 벤치마크 (Docker 불필요)
+go test github.com/kangheeyong/drp/internal/... -bench=. -benchmem
 ```

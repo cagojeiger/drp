@@ -31,9 +31,9 @@ RouteConfig {
 
 ### 와일드카드 규칙
 
-- `*.example.com` → `foo.example.com` ✅, `bar.example.com` ✅
-- `*.example.com` → `example.com` ❌ (서브도메인 없음)
-- `*.example.com` → `foo.bar.example.com` ❌ (2단계 이상)
+- `*.example.com` → `foo.example.com` O, `bar.example.com` O
+- `*.example.com` → `example.com` X (서브도메인 없음)
+- `*.example.com` → `foo.bar.example.com` X (2단계 이상)
 
 ## 경로 매칭
 
@@ -52,6 +52,15 @@ Longest prefix match.
 - **Remove(proxyName)**: 해당 프록시의 모든 도메인+경로 일괄 제거
 - **연결 끊김**: 해당 frpc가 등록한 모든 프록시 자동 제거
 
+## Pool 조회 경로
+
+```
+기존: ServeHTTP → Lookup → cfg.ProxyName → RangeByProxy(proxyName) O(N) → runID → Registry.Get
+개선: ServeHTTP → Lookup → cfg.RunID → Registry.Get(runID) O(1)
+```
+
+RangeByProxy 메서드는 제거. Lookup 결과에 RunID가 이미 포함되어 있으므로 역방향 조회 불필요.
+
 ### 구현
 
-`internal/router` — Router.Add, Remove, Lookup, RangeByProxy
+`internal/router` — Router.Add, Remove, Lookup
