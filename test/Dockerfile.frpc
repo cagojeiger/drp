@@ -1,0 +1,12 @@
+FROM alpine:3.20
+ARG FRP_VERSION=0.68.0
+ARG TARGETARCH
+RUN apk add --no-cache curl tar && \
+    ARCH=$(case ${TARGETARCH} in amd64) echo "amd64";; arm64) echo "arm64";; *) echo "amd64";; esac) && \
+    curl -fSL "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_${ARCH}.tar.gz" \
+    -o /tmp/frp.tar.gz && \
+    tar -xzf /tmp/frp.tar.gz -C /tmp && \
+    mv /tmp/frp_${FRP_VERSION}_linux_${ARCH}/frpc /usr/local/bin/frpc && \
+    rm -rf /tmp/frp* && \
+    apk del curl tar
+ENTRYPOINT ["frpc"]
