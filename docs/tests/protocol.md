@@ -1,6 +1,6 @@
 # 프로토콜 테스트
 
-`internal/msg`, `internal/auth`, `internal/crypto` 대상. 24개 + 벤치마크 7개.
+`internal/msg`, `internal/auth`, `internal/crypto` 대상. 26개 + 벤치마크 7개.
 
 ## 와이어 포맷 (6) — internal/msg
 

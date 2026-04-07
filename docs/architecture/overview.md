@@ -43,7 +43,7 @@ cmd/drps/main.go          ← 진입점: 설정 로드 + TCP 리스너 + HTTP �
 │   └── auth.go            ← BuildAuthKey, VerifyAuth
 │
 └── internal/crypto/       ← 암호화 + 압축
-    ├── crypto.go          ← DeriveKey, KeyCache, NewCryptoWriter/Reader
+    ├── crypto.go          ← DeriveKey, NewCryptoWriter/Reader
     └── snappy.go          ← NewSnappyWriter/Reader
 ```
 

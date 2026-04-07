@@ -90,12 +90,12 @@ type Handler struct {
 }
 ```
 
-**PoolLookup 시그니처 변경**: `proxyName` → `runID` 기반 조회로 변경. Router.Lookup 결과의 `cfg.RunID`를 직접 사용하여 이중 조회 제거.
+**PoolLookup**: `runID` 기반 조회. Router.Lookup 결과의 `cfg.RunID`를 직접 사용하여 이중 조회 제거.
 
 **ServeHTTP(w, r)**:
 1. Router.Lookup(Host, Path) → RouteConfig
 2. Basic Auth 검증 (HTTPUser 설정 시)
-3. poolLookup(cfg.RunID) → Pool 획득 (RangeByProxy 순회 제거)
+3. poolLookup(cfg.RunID) → Pool 획득
 4. Pool.Get() → 워크 커넥션 획득
 5. wrap.Wrap(conn, aesKey, ...) → StartWorkConn + 암호화/압축 (캐시된 키 사용)
 6. Custom Headers 주입 + HostHeaderRewrite 적용
@@ -132,8 +132,6 @@ type RouteConfig struct {
 2. longest prefix match (`/api/v2` > `/api` > `/`)
 
 **Remove(proxyName)**: 해당 프록시의 모든 도메인/경로를 일괄 제거.
-
-**RangeByProxy 제거**: 더 이상 proxyName→runID 역방향 조회 불필요. Lookup 결과에 RunID가 이미 포함.
 
 ---
 
@@ -177,10 +175,10 @@ frp 와이어 프로토콜. `[1B type][8B length BE][JSON body]`
 
 frp v0.68.0 필드 완전 일치. MaxBodySize = 10240.
 
-### 성능 개선
+### 성능 설계
 
-- **WriteMsg**: type + length + body를 단일 버퍼에 조립 → 1회 Write (기존 3회 → 1회 syscall)
-- **TypeOf**: `fmt.Sprintf("%T")` 대신 switch type assertion (할당 없음)
+- **WriteMsg**: type + length + body를 단일 버퍼에 조립 → 1회 Write (1 syscall)
+- **TypeOf**: switch type assertion (할당 없음)
 - **ReadMsg**: 헤더 버퍼(9바이트) 스택 할당, body는 sync.Pool 재사용
 
 ---
@@ -198,25 +196,6 @@ frp v0.68.0 필드 완전 일치. MaxBodySize = 10240.
 - **NewSnappyWriter/Reader**: snappy 압축, Write마다 자동 Flush
 
 DeriveKey는 서버 시작 시 1회만 호출. 결과를 proxy.Handler.aesKey에 캐시.
-
----
-
-## 현재 코드의 성능 병목 요약
-
-HTTP 요청 hot path에서 매 요청마다 발생하는 불필요한 비용:
-
-| 위치 | 코드 | 문제 | 비용 |
-|------|------|------|------|
-| `main.go:39` | poolLookup 클로저 | RangeByProxy O(N) 역방향 조회 (Lookup이 이미 RunID 반환) | O(전체 라우트 수) |
-| `router.go:111` | RangeByProxy | exact+wildcard 전체 순회하여 proxyName→RunID 검색 | O(N) |
-| `router.go:133` | matchRoutes | 정렬 없이 전체 경로 순회하여 longest prefix 검색 | O(도메인별 경로 수) |
-| `wrap.go:30` | Wrap → DeriveKey | 동일 토큰에 대해 매번 PBKDF2 키 파생 | ~50μs CPU |
-| `msg.go:49` | WriteMsg | type/length/body 3번 개별 Write | 3 syscall |
-| `msg.go:43` | TypeOf | fmt.Sprintf("%T") 문자열 할당 | 1+ alloc |
-| `proxy.go:47,67,74,84` | log.Printf | 매 요청 5회 로그 출력 (뮤텍스 + fmt + syscall) | 5 syscall |
-| `proxy.go:198` | bufio.NewReader | 매 RoundTrip 새 4KB 버퍼 할당 | 1 alloc |
-
-이 비용들이 모두 **매 HTTP 요청의 직렬 경로**에 놓여 있어, 개별로는 작아도 누적되면 지연을 증가시킨다.
 
 ## 외부 의존성
 
