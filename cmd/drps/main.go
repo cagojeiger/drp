@@ -5,6 +5,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/pprof"
+	"os"
+	"time"
 
 	"github.com/hashicorp/yamux"
 	"github.com/kangheeyong/drp/internal/config"
@@ -18,21 +21,28 @@ import (
 
 func main() {
 	cfg := config.Load()
+	debug := os.Getenv("DRPS_DEBUG") == "1"
 
 	rt := router.New()
 	registry := pool.NewRegistry()
 	aesKey := crypto.DeriveKey(cfg.Token)
+	reqStats := &server.ReqWorkConnStats{}
 
 	h := &server.Handler{
-		Token:  cfg.Token,
-		Router: rt,
+		Token:    cfg.Token,
+		Router:   rt,
+		ReqStats: reqStats,
 		OnControlClose: func(runID string) {
-			log.Printf("control closed: runID=%s", runID)
+			if debug {
+				log.Printf("control closed: runID=%s", runID)
+			}
 			registry.Remove(runID)
 		},
 	}
 	h.OnWorkConn = func(conn net.Conn, m *msg.NewWorkConn) {
-		log.Printf("work conn: runID=%s", m.RunID)
+		if debug {
+			log.Printf("work conn: runID=%s", m.RunID)
+		}
 		p := registry.GetOrCreate(m.RunID, h.ReqWorkConnFunc(m.RunID), cfg.PoolCapacity)
 		p.Put(conn)
 	}
@@ -40,6 +50,17 @@ func main() {
 	proxyHandler := proxy.NewHandler(rt, func(runID string) (*pool.Pool, bool) {
 		return registry.Get(runID)
 	}, aesKey)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/__drps/metrics", server.MetricsHandler(reqStats, registry.AggregateStats))
+	if os.Getenv("DRPS_PPROF") == "1" {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		log.Printf("pprof enabled on %s/debug/pprof/", cfg.HTTPAddr)
+	}
+	mux.Handle("/", proxyHandler)
 
 	// frpc 리스너
 	frpcLn, err := net.Listen("tcp", cfg.FrpcAddr)
@@ -59,12 +80,19 @@ func main() {
 		}
 	}()
 
-	log.Fatal(http.ListenAndServe(cfg.HTTPAddr, proxyHandler))
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 60 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }
 
 func handleTCP(conn net.Conn, h *server.Handler) {
 	cfg := yamux.DefaultConfig()
 	cfg.LogOutput = io.Discard
+	// frps와 동일하게 스트림 윈도우를 크게 잡아 window-update 프레임 빈도를 낮춘다.
+	cfg.MaxStreamWindowSize = 6 * 1024 * 1024
 
 	session, err := yamux.Server(conn, cfg)
 	if err != nil {

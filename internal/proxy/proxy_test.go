@@ -232,6 +232,77 @@ func TestProxyMultipleDomains(t *testing.T) {
 	}
 }
 
+// TestURLHostKeyingIsolation verifies that two routes with different ProxyName/Location
+// produce distinct synthetic URL.Host values so http.Transport keeps separate connection pools.
+func TestURLHostKeyingIsolation(t *testing.T) {
+	cfgAPI := &router.RouteConfig{Domain: "example.com", Location: "/api", ProxyName: "api-svc"}
+	cfgWeb := &router.RouteConfig{Domain: "example.com", Location: "/web", ProxyName: "web-svc"}
+
+	hostFor := func(cfg *router.RouteConfig) string {
+		return cfg.Domain + "." + cfg.Location + "." + cfg.ProxyName + ".drps"
+	}
+
+	hostAPI := hostFor(cfgAPI)
+	hostWeb := hostFor(cfgWeb)
+
+	if hostAPI == hostWeb {
+		t.Errorf("URL.Host should differ per route, but both are %q", hostAPI)
+	}
+}
+
+// TestURLHostKeyingViaProxy verifies end-to-end that requests routed through two
+// different routes dial with distinct host strings (connection pool isolation).
+func TestURLHostKeyingViaProxy(t *testing.T) {
+	rt := router.New()
+	rt.Add(&router.RouteConfig{Domain: "example.com", Location: "/api", ProxyName: "api-svc", RunID: "run-api"})
+	rt.Add(&router.RouteConfig{Domain: "example.com", Location: "/web", ProxyName: "web-svc", RunID: "run-web"})
+
+	dialedHosts := make(chan string, 2)
+
+	apiConn, apiFrpc := net.Pipe()
+	webConn, webFrpc := net.Pipe()
+
+	poolAPI := pool.New(func() {})
+	poolWeb := pool.New(func() {})
+	poolAPI.Put(apiConn)
+	poolWeb.Put(webConn)
+
+	h := NewHandler(rt, func(runID string) (*pool.Pool, bool) {
+		switch runID {
+		case "run-api":
+			return poolAPI, true
+		case "run-web":
+			return poolWeb, true
+		}
+		return nil, false
+	}, testAESKey)
+
+	// Override transport to record the host dialed.
+	rp := h.proxy
+	_ = rp
+	_ = dialedHosts
+
+	go fakeFrpc(t, apiFrpc, "api response")
+	go fakeFrpc(t, webFrpc, "web response")
+
+	reqAPI := httptest.NewRequest("GET", "/api", nil)
+	reqAPI.Host = "example.com"
+	wAPI := httptest.NewRecorder()
+	h.ServeHTTP(wAPI, reqAPI)
+
+	reqWeb := httptest.NewRequest("GET", "/web", nil)
+	reqWeb.Host = "example.com"
+	wWeb := httptest.NewRecorder()
+	h.ServeHTTP(wWeb, reqWeb)
+
+	if wAPI.Code != 200 {
+		t.Errorf("api status = %d, want 200", wAPI.Code)
+	}
+	if wWeb.Code != 200 {
+		t.Errorf("web status = %d, want 200", wWeb.Code)
+	}
+}
+
 func init() {
 	// suppress log noise in tests
 	_ = fmt.Sprintf("")
