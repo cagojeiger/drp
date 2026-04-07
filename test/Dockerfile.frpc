@@ -1,0 +1,10 @@
+FROM alpine:3.20
+ARG FRP_VERSION=0.68.0
+RUN apk add --no-cache curl tar && \
+    curl -fSL "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_arm64.tar.gz" \
+    -o /tmp/frp.tar.gz && \
+    tar -xzf /tmp/frp.tar.gz -C /tmp && \
+    mv /tmp/frp_${FRP_VERSION}_linux_arm64/frpc /usr/local/bin/frpc && \
+    rm -rf /tmp/frp* && \
+    apk del curl tar
+ENTRYPOINT ["frpc"]

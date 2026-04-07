@@ -1,0 +1,6 @@
+.repos
+docs_legacy
+bin
+test
+.git
+*.toml

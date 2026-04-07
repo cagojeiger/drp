@@ -2,134 +2,60 @@
 
 ## drps란?
 
-drps는 frp의 서버(frps)를 HTTP 전용으로 새로 만든 리버스 프록시 서버입니다.
-frps는 단일 인스턴스로만 동작하지만, drps는 분산 환경을 목표로 설계합니다.
+frps(frp server)의 HTTP 전용 대체. frpc를 수정 없이 사용하며, frp 패키지를 import하지 않고 프로토콜을 직접 구현한다.
 
-## 3개 레이어
+## 전체 흐름
 
-drps는 **두 개의 서로 다른 프로토콜을 연결하는 브릿지**입니다.
-
-```mermaid
-graph TB
-    Client["HTTP Client"]
-    Ingress["Ingress TLS"]
-    FRPC["frpc Client"]
-    Local["localhost:3000"]
-
-    Client -->|"HTTP/1.1"| Ingress
-    Ingress -->|"HTTP"| SL
-
-    subgraph DRPS["drps"]
-        SL["Service Layer"]
-        BL["Bridge Layer"]
-        PL["Protocol Layer"]
-
-        SL -->|"RouteConfig"| BL
-        BL -->|"WorkConn"| PL
-    end
-
-    PL -->|"yamux AES"| FRPC
-    FRPC --> Local
+```
+[클라이언트] → HTTP :18080 → [proxy] → [router] → [pool] → [wrap] → [frpc] → [백엔드]
+                                                                        ↑
+[frpc] → TCP :17000 → [yamux] → [server/handle] → Login/NewProxy/WorkConn
 ```
 
-| 레이어 | 관심사 | 상세 |
-|--------|--------|------|
-| **Service Layer** | "이 HTTP 요청을 어떻게 처리할까?" | [service-layer.md](service-layer.md) |
-| **Bridge Layer** | "이 요청을 어떤 frpc에게 보낼까?" | [bridge-layer.md](bridge-layer.md) |
-| **Protocol Layer** | "frpc와 어떻게 대화할까?" | [protocol-layer.md](protocol-layer.md) |
+## 컴포넌트 구조
 
-## 전체 요청 흐름
-
-```mermaid
-sequenceDiagram
-    participant C as HTTPClient
-    participant S as ServiceLayer
-    participant B as BridgeLayer
-    participant P as ProtocolLayer
-    participant F as frpc
-
-    C->>S: GET Host app.example.com
-    S->>B: Lookup domain path
-    B-->>S: RouteConfig
-    S->>S: BasicAuth
-    S->>B: GetWorkConn
-    B->>P: Control.GetWorkConn
-    P-->>B: yamux stream
-    B->>B: AES snappy wrap
-    B-->>S: net.Conn
-    S->>F: HTTP request
-    F-->>S: HTTP response
-    S->>S: ModifyResponse
-    S-->>C: HTTP Response
+```
+cmd/drps/main.go          ← 진입점: TCP 리스너 + HTTP 서버 + 조립
+│
+├── internal/server/       ← Protocol Layer: frpc 연결 처리
+│   └── handle.go          ← HandleConnection, controlLoop
+│
+├── internal/proxy/        ← Service Layer: HTTP 요청 처리
+│   └── proxy.go           ← ServeHTTP, connTransport, handleUpgrade
+│
+├── internal/router/       ← Bridge Layer: 라우팅 테이블
+│   └── router.go          ← Add, Remove, Lookup
+│
+├── internal/pool/         ← 워크 커넥션 관리
+│   ├── pool.go            ← Get, Put, Close
+│   └── registry.go        ← RunID → Pool 매핑
+│
+├── internal/wrap/         ← 커넥션 래핑
+│   └── wrap.go            ← StartWorkConn + AES + snappy
+│
+├── internal/msg/          ← 와이어 프로토콜
+│   └── msg.go             ← ReadMsg, WriteMsg, 구조체 10개
+│
+├── internal/auth/         ← 토큰 인증
+│   └── auth.go            ← BuildAuthKey, VerifyAuth
+│
+└── internal/crypto/       ← 암호화 + 압축
+    ├── crypto.go          ← DeriveKey, NewCryptoWriter/Reader
+    └── snappy.go          ← NewSnappyWriter/Reader
 ```
 
-## frpc 등록 흐름
+## 의존성 방향
 
-```mermaid
-sequenceDiagram
-    participant F as frpc
-    participant P as ProtocolLayer
-    participant B as BridgeLayer
-
-    F->>P: TCP connect yamux
-    F->>P: Login plaintext
-    P->>P: verify auth
-    P-->>F: LoginResp
-    P->>P: start AES encryption
-
-    F->>P: NewProxy encrypted
-    Note right of P: type http domain location
-    P->>B: Register RouteConfig
-    B->>B: add to routing table
-    P-->>F: NewProxyResp
-
-    P-->>F: ReqWorkConn pool init
-    F->>P: NewWorkConn new stream
-    P->>P: store in workConnCh
+```
+main.go
+  ├── server  → msg, auth, crypto, router
+  ├── proxy   → router, pool, wrap
+  ├── wrap    → msg, crypto
+  ├── pool    (독립)
+  ├── router  (독립)
+  ├── msg     (독립)
+  ├── auth    (독립)
+  └── crypto  (독립)
 ```
 
-## 레이어 독립성
-
-```mermaid
-graph LR
-    subgraph SvcLayer["Service Layer"]
-        HTTP["HTTP Listener"]
-        RP["ReverseProxy"]
-        Auth["Basic Auth"]
-    end
-
-    subgraph BrgLayer["Bridge Layer"]
-        Router["Routing Table"]
-        RC["RouteConfig"]
-        IF["Interface"]
-    end
-
-    subgraph PrtLayer["Protocol Layer"]
-        TCP["TCP Listener"]
-        Ctrl["Control"]
-        Pool["WorkConn Pool"]
-    end
-
-    RP -->|"Lookup"| Router
-    Ctrl -->|"Register"| IF
-    IF -.->|"impl"| Router
-    RP -->|"GetWorkConn"| RC
-    RC -->|"call"| Pool
-```
-
-각 레이어는 인터페이스를 통해서만 소통합니다.
-**분산 확장 시 Bridge Layer만 교체하면 됩니다.**
-
-## 파일 매핑
-
-| 레이어 | 소스 파일 | 역할 |
-|--------|----------|------|
-| Protocol | `service.go` (TCP) | frpc 연결 수락, yamux |
-| Protocol | `control.go` | 제어 채널, 메시지 처리, 워크 커넥션 풀 |
-| Protocol | `control_manager.go` | 모든 frpc 관리 |
-| Protocol | `auth.go` | 토큰 인증 |
-| Service | `service.go` (HTTP) | HTTP 요청 수신 |
-| Service | `httpproxy.go` | ReverseProxy, 헤더, WebSocket |
-| Bridge | `router.go` | 라우팅 테이블 |
-| Bridge | `interfaces.go` | 레이어 간 계약 |
-| Bridge | `config.go` | 서버 설정 |
+순환 의존성 없음. 각 패키지는 단일 책임.

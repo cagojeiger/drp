@@ -4,8 +4,8 @@
 *.dll
 *.so
 *.dylib
-drps
-bin/
+/drps
+/bin/
 
 # Test binary
 *.test
