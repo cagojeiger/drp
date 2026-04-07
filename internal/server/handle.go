@@ -46,7 +46,7 @@ func (ce *controlEntry) Send(m msg.Message) {
 
 // controlManager tracks active controls by runID for reconnect handling.
 type controlManager struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	entries map[string]*controlEntry
 }
 
@@ -69,8 +69,8 @@ func (cm *controlManager) Remove(runID string) {
 }
 
 func (cm *controlManager) GetEntry(runID string) (*controlEntry, bool) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
 	e, ok := cm.entries[runID]
 	return e, ok
 }

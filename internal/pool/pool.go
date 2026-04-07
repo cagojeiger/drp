@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -12,6 +13,7 @@ import (
 type Pool struct {
 	conns      chan net.Conn
 	requestFn  func()
+	refilling  atomic.Bool // prevents goroutine explosion on eager refill
 	closed     bool
 	closedOnce sync.Once
 	mu         sync.Mutex
@@ -50,7 +52,7 @@ func (p *Pool) Put(conn net.Conn) {
 
 // Get retrieves a work connection from the pool.
 // If empty, requests a new one and waits up to timeout.
-// After successful Get, triggers eager refill.
+// After successful Get, triggers eager refill (at most 1 in-flight).
 func (p *Pool) Get(timeout time.Duration) (net.Conn, error) {
 	p.mu.Lock()
 	if p.closed {
@@ -65,7 +67,7 @@ func (p *Pool) Get(timeout time.Duration) (net.Conn, error) {
 		if !ok {
 			return nil, fmt.Errorf("pool closed")
 		}
-		go p.requestFn() // eager refill
+		p.tryRefill()
 		return conn, nil
 	default:
 	}
@@ -81,10 +83,20 @@ func (p *Pool) Get(timeout time.Duration) (net.Conn, error) {
 		if !ok {
 			return nil, fmt.Errorf("pool closed")
 		}
-		go p.requestFn() // eager refill
+		p.tryRefill()
 		return conn, nil
 	case <-timer.C:
 		return nil, fmt.Errorf("get work conn timeout after %s", timeout)
+	}
+}
+
+// tryRefill triggers an async refill if one is not already in-flight.
+func (p *Pool) tryRefill() {
+	if p.refilling.CompareAndSwap(false, true) {
+		go func() {
+			p.requestFn()
+			p.refilling.Store(false)
+		}()
 	}
 }
 
