@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kangheeyong/drp/internal/auth"
@@ -16,6 +18,18 @@ import (
 
 const defaultReadTimeout = 10 * time.Second
 
+const (
+	reqWorkBatchMax         = 128
+	reqWorkBatchMid         = 64
+	reqWorkBatchLow         = 16
+	reqWorkFlushFloor       = 50 * time.Microsecond
+	reqWorkFlushDefault     = 200 * time.Microsecond
+	reqWorkFlushCeil        = 400 * time.Microsecond
+	controlWriteBufferBytes = 64 * 1024
+	controlReqChSize        = 2048
+	controlSendChSize       = 1024
+)
+
 // Handler handles a single frpc stream (yamux or raw connection).
 // It reads the first message and routes to Login or NewWorkConn.
 type Handler struct {
@@ -23,16 +37,48 @@ type Handler struct {
 	ReadTimeout      time.Duration
 	HeartbeatTimeout time.Duration
 	Router           *router.Router
+	ReqStats         *ReqWorkConnStats
 	OnWorkConn       func(conn net.Conn, m *msg.NewWorkConn)
 	OnControlClose   func(runID string)
 	controls         controlManager
+}
+
+type ReqWorkConnStats struct {
+	requested atomic.Int64
+	enqueued  atomic.Int64
+	dropped   atomic.Int64
+	sent      atomic.Int64
+	inflight  atomic.Int64
+}
+
+type ReqWorkConnSnapshot struct {
+	Requested int64 `json:"requested"`
+	Enqueued  int64 `json:"enqueued"`
+	Dropped   int64 `json:"dropped"`
+	Sent      int64 `json:"sent"`
+	Inflight  int64 `json:"inflight"`
+}
+
+func (s *ReqWorkConnStats) Snapshot() ReqWorkConnSnapshot {
+	if s == nil {
+		return ReqWorkConnSnapshot{}
+	}
+	return ReqWorkConnSnapshot{
+		Requested: s.requested.Load(),
+		Enqueued:  s.enqueued.Load(),
+		Dropped:   s.dropped.Load(),
+		Sent:      s.sent.Load(),
+		Inflight:  s.inflight.Load(),
+	}
 }
 
 // controlEntry holds the cancel function and send channel for a single control session.
 // All writes to the control channel go through sendCh → sendLoop (single writer).
 type controlEntry struct {
 	cancel context.CancelFunc
+	reqCh  chan struct{}
 	sendCh chan msg.Message
+	done   <-chan struct{}
 }
 
 // Send enqueues a message to the control channel's write queue.
@@ -44,13 +90,26 @@ func (ce *controlEntry) Send(m msg.Message) {
 	}
 }
 
+// SendReqWorkConn enqueues ReqWorkConn with delivery guarantee while the control is alive.
+func (ce *controlEntry) SendReqWorkConn() bool {
+	defer func() {
+		recover()
+	}()
+	select {
+	case ce.reqCh <- struct{}{}:
+		return true
+	case <-ce.done:
+		return false
+	}
+}
+
 // controlManager tracks active controls by runID for reconnect handling.
 type controlManager struct {
 	mu      sync.RWMutex
 	entries map[string]*controlEntry
 }
 
-func (cm *controlManager) Register(runID string, cancel context.CancelFunc, sendCh chan msg.Message) {
+func (cm *controlManager) Register(runID string, cancel context.CancelFunc, reqCh chan struct{}, sendCh chan msg.Message, done <-chan struct{}) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	if cm.entries == nil {
@@ -59,7 +118,7 @@ func (cm *controlManager) Register(runID string, cancel context.CancelFunc, send
 	if old, ok := cm.entries[runID]; ok {
 		old.cancel()
 	}
-	cm.entries[runID] = &controlEntry{cancel: cancel, sendCh: sendCh}
+	cm.entries[runID] = &controlEntry{cancel: cancel, reqCh: reqCh, sendCh: sendCh, done: done}
 }
 
 func (cm *controlManager) Remove(runID string) {
@@ -83,7 +142,19 @@ func (h *Handler) ReqWorkConnFunc(runID string) func() {
 		if !ok {
 			return
 		}
-		e.Send(&msg.ReqWorkConn{})
+		if h.ReqStats != nil {
+			h.ReqStats.requested.Add(1)
+		}
+		if e.SendReqWorkConn() {
+			if h.ReqStats != nil {
+				h.ReqStats.enqueued.Add(1)
+				h.ReqStats.inflight.Add(1)
+			}
+			return
+		}
+		if h.ReqStats != nil {
+			h.ReqStats.dropped.Add(1)
+		}
 	}
 }
 
@@ -155,24 +226,204 @@ func (h *Handler) handleLogin(conn net.Conn, login *msg.Login) {
 	}
 
 	// 제어 채널 write 큐 + 전용 sendLoop
-	sendCh := make(chan msg.Message, 100)
-	go sendLoop(encWriter, sendCh)
+	ctx, cancel := context.WithCancel(context.Background())
+	reqCh := make(chan struct{}, controlReqChSize)
+	sendCh := make(chan msg.Message, controlSendChSize)
+	go sendLoop(encWriter, reqCh, sendCh, h.ReqStats)
 
-	// ReqWorkConn × PoolCount (sendLoop 시작 후)
-	for range login.PoolCount {
-		sendCh <- &msg.ReqWorkConn{}
-	}
+	h.bootstrapReqWorkConn(login.PoolCount, reqCh)
 
 	// 재연결 관리: 같은 RunID가 오면 old를 취소
-	ctx, cancel := context.WithCancel(context.Background())
-	h.controls.Register(runID, cancel, sendCh)
+	h.controls.Register(runID, cancel, reqCh, sendCh, ctx.Done())
 
 	// 제어 루프: 암호화된 메시지 수신 → 처리
 	registeredProxies := make(map[string]struct{})
 	h.controlLoop(ctx, conn, encReader, sendCh, runID, registeredProxies)
 
+	h.cleanupControlSession(cancel, reqCh, sendCh, runID, registeredProxies)
+}
+
+// sendLoop is the single writer goroutine for the control channel.
+// It drains sendCh and writes messages sequentially to the encrypted writer.
+func sendLoop(w io.Writer, reqCh <-chan struct{}, sendCh <-chan msg.Message, stats *ReqWorkConnStats) {
+	bw := bufio.NewWriterSize(w, controlWriteBufferBytes)
+	defer bw.Flush()
+
+	flushTimer := time.NewTimer(time.Hour)
+	stopTimer(flushTimer)
+
+	pendingFlush := false
+
+	flushDelay := func() time.Duration {
+		q := len(reqCh)
+		switch {
+		case q >= 512:
+			return reqWorkFlushFloor
+		case q >= 128:
+			return reqWorkFlushDefault
+		default:
+			return reqWorkFlushCeil
+		}
+	}
+
+	batchLimit := func() int {
+		q := len(reqCh)
+		switch {
+		case q >= 512:
+			return reqWorkBatchMax
+		case q >= 128:
+			return reqWorkBatchMid
+		default:
+			return reqWorkBatchLow
+		}
+	}
+
+	flush := func() error {
+		if !pendingFlush {
+			return nil
+		}
+		if err := bw.Flush(); err != nil {
+			return err
+		}
+		pendingFlush = false
+		stopTimer(flushTimer)
+		return nil
+	}
+
+	writeReq := func(count int) error {
+		if count <= 0 {
+			return nil
+		}
+		if stats != nil {
+			c := int64(count)
+			stats.sent.Add(c)
+			stats.inflight.Add(-c)
+		}
+		if err := msg.WriteMsg(bw, &msg.ReqWorkConn{Count: count}); err != nil {
+			return err
+		}
+		pendingFlush = true
+		resetTimer(flushTimer, flushDelay())
+		return nil
+	}
+
+	writeReqBatch := func() error {
+		if reqCh == nil {
+			return nil
+		}
+		limit := batchLimit()
+		if limit <= 0 {
+			limit = 1
+		}
+		batch := 0
+		for batch < limit {
+			select {
+			case _, ok := <-reqCh:
+				if !ok {
+					reqCh = nil
+					return nil
+				}
+				batch++
+			default:
+				if batch == 0 {
+					return nil
+				}
+				return writeReq(batch)
+			}
+		}
+		if err := writeReq(batch); err != nil {
+			return err
+		}
+		if limit >= reqWorkBatchMid {
+			return flush()
+		}
+		return nil
+	}
+
+	for reqCh != nil || sendCh != nil {
+		// Prioritize refill signals so work-conn pool stays warm.
+		select {
+		case _, ok := <-reqCh:
+			if !ok {
+				reqCh = nil
+				continue
+			}
+			if err := writeReq(1); err != nil {
+				return
+			}
+			if err := writeReqBatch(); err != nil {
+				return
+			}
+			continue
+		default:
+		}
+
+		select {
+		case _, ok := <-reqCh:
+			if !ok {
+				reqCh = nil
+				continue
+			}
+			if err := writeReq(1); err != nil {
+				return
+			}
+			if err := writeReqBatch(); err != nil {
+				return
+			}
+		case m, ok := <-sendCh:
+			if !ok {
+				sendCh = nil
+				continue
+			}
+			// control 응답은 지연을 줄이기 위해 즉시 flush한다.
+			if err := flush(); err != nil {
+				return
+			}
+			if err := msg.WriteMsg(bw, m); err != nil {
+				return
+			}
+			pendingFlush = true
+			if err := flush(); err != nil {
+				return
+			}
+		case <-flushTimer.C:
+			if err := flush(); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func stopTimer(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
+func resetTimer(t *time.Timer, d time.Duration) {
+	stopTimer(t)
+	t.Reset(d)
+}
+
+func (h *Handler) bootstrapReqWorkConn(poolCount int, reqCh chan<- struct{}) {
+	for range poolCount {
+		if h.ReqStats != nil {
+			h.ReqStats.requested.Add(1)
+			h.ReqStats.enqueued.Add(1)
+			h.ReqStats.inflight.Add(1)
+		}
+		reqCh <- struct{}{}
+	}
+}
+
+func (h *Handler) cleanupControlSession(cancel context.CancelFunc, reqCh chan struct{}, sendCh chan msg.Message, runID string, registeredProxies map[string]struct{}) {
 	// 연결 종료 시 정리
-	close(sendCh) // sendLoop 종료
+	cancel()
+	close(reqCh)
+	close(sendCh)
 	h.controls.Remove(runID)
 	if h.Router != nil {
 		for name := range registeredProxies {
@@ -181,16 +432,6 @@ func (h *Handler) handleLogin(conn net.Conn, login *msg.Login) {
 	}
 	if h.OnControlClose != nil {
 		h.OnControlClose(runID)
-	}
-}
-
-// sendLoop is the single writer goroutine for the control channel.
-// It drains sendCh and writes messages sequentially to the encrypted writer.
-func sendLoop(w io.Writer, sendCh <-chan msg.Message) {
-	for m := range sendCh {
-		if err := msg.WriteMsg(w, m); err != nil {
-			return
-		}
 	}
 }
 

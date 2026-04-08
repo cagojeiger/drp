@@ -1,0 +1,4 @@
+bindPort = 17000
+vhostHTTPPort = 28080
+auth.method = "token"
+auth.token = "bench-token"

@@ -2,6 +2,7 @@ package router
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -60,6 +61,10 @@ func (r *Router) Add(cfg *RouteConfig) error {
 
 	cfg.Location = loc
 	store[key] = append(store[key], cfg)
+	slices.SortFunc(store[key], func(a, b *RouteConfig) int {
+		// Longest prefix first for faster Lookup short-circuit.
+		return len(b.Location) - len(a.Location)
+	})
 	return nil
 }
 
@@ -113,18 +118,10 @@ func (r *Router) matchRoutes(routes []*RouteConfig, path string) (*RouteConfig, 
 		return nil, false
 	}
 
-	var best *RouteConfig
-	bestLen := -1
-
 	for _, rc := range routes {
-		if strings.HasPrefix(path, rc.Location) && len(rc.Location) > bestLen {
-			best = rc
-			bestLen = len(rc.Location)
+		if strings.HasPrefix(path, rc.Location) {
+			return rc, true
 		}
 	}
-
-	if best == nil {
-		return nil, false
-	}
-	return best, true
+	return nil, false
 }

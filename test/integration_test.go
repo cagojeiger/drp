@@ -2,10 +2,14 @@ package test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,6 +91,88 @@ func startBackend(ctx context.Context, t *testing.T, netName string) testcontain
 		t.Fatalf("start backend: %v", err)
 	}
 	return c
+}
+
+func startWSEcho(ctx context.Context, t *testing.T, netName string) testcontainers.Container {
+	t.Helper()
+	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			FromDockerfile: testcontainers.FromDockerfile{
+				Context:    "../bench/ws-echo",
+				Dockerfile: "Dockerfile",
+			},
+			ExposedPorts: []string{"9090/tcp"},
+			Networks:     []string{netName},
+			NetworkAliases: map[string][]string{
+				netName: {"ws-echo"},
+			},
+			WaitingFor: wait.ForListeningPort("9090/tcp").WithStartupTimeout(30 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start ws-echo: %v", err)
+	}
+	return c
+}
+
+func doRawWSEcho(addr string, hostHeader string) error {
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	upgrade := "GET /ws HTTP/1.1\r\n" +
+		"Host: " + hostHeader + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"\r\n"
+	if _, err := conn.Write([]byte(upgrade)); err != nil {
+		return fmt.Errorf("write upgrade: %w", err)
+	}
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+	resp := string(buf[:n])
+	if !strings.Contains(resp, "101") {
+		return fmt.Errorf("not 101: %.80s", resp)
+	}
+
+	payload := []byte("hello")
+	frame := make([]byte, 2+4+len(payload))
+	frame[0] = 0x81
+	frame[1] = byte(len(payload)) | 0x80
+	copy(frame[6:], payload)
+	if _, err := conn.Write(frame); err != nil {
+		return fmt.Errorf("write frame: %w", err)
+	}
+
+	n, err = conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("read echo: %w", err)
+	}
+	if n < 2 {
+		return fmt.Errorf("short frame: %d", n)
+	}
+	if buf[0] != 0x81 {
+		return fmt.Errorf("unexpected opcode: 0x%02x", buf[0])
+	}
+	frameLen := int(buf[1] & 0x7f)
+	if frameLen != len(payload) {
+		return fmt.Errorf("payload length %d, want %d", frameLen, len(payload))
+	}
+	got := string(buf[2 : 2+frameLen])
+	if got != "hello" {
+		return fmt.Errorf("echo = %q, want %q", got, "hello")
+	}
+	return nil
 }
 
 func TestFrpcLoginSuccess(t *testing.T) {
@@ -325,3 +411,521 @@ customDomains = ["site-b.local"]
 		resp.Body.Close()
 	}
 }
+
+func TestWebSocketE2E(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+
+	netw, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	defer netw.Remove(ctx)
+
+	wsEcho := startWSEcho(ctx, t, netw.Name)
+	defer wsEcho.Terminate(ctx)
+
+	drps := startDrps(ctx, t, netw.Name)
+	defer drps.Terminate(ctx)
+
+	frpcToml := `
+serverAddr = "drps"
+serverPort = 17000
+auth.token = "test-token"
+transport.tls.enable = false
+
+[[proxies]]
+name = "bench-ws"
+type = "http"
+localIP = "ws-echo"
+localPort = 9090
+customDomains = ["ws.local"]
+`
+	frpc := startFrpc(ctx, t, netw.Name, frpcToml, "start proxy success")
+	defer frpc.Terminate(ctx)
+
+	port, _ := drps.MappedPort(ctx, "18080/tcp")
+	host, _ := drps.Host(ctx)
+	addr := net.JoinHostPort(host, port.Port())
+
+	var lastErr error
+	for range 5 {
+		lastErr = doRawWSEcho(addr, "ws.local")
+		if lastErr == nil {
+			return
+		}
+		time.Sleep(700 * time.Millisecond)
+	}
+	t.Fatalf("ws upgrade/echo failed: %v", lastErr)
+}
+
+func TestMetricsEndpointAfterTraffic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+
+	netw, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	defer netw.Remove(ctx)
+
+	backend := startBackend(ctx, t, netw.Name)
+	defer backend.Terminate(ctx)
+
+	drps := startDrps(ctx, t, netw.Name)
+	defer drps.Terminate(ctx)
+
+	frpcToml := `
+serverAddr = "drps"
+serverPort = 17000
+auth.token = "test-token"
+transport.tls.enable = false
+
+[[proxies]]
+name = "web"
+type = "http"
+localIP = "backend"
+localPort = 80
+customDomains = ["test.local"]
+`
+	frpc := startFrpc(ctx, t, netw.Name, frpcToml, "start proxy success")
+	defer frpc.Terminate(ctx)
+
+	port, _ := drps.MappedPort(ctx, "18080/tcp")
+	host, _ := drps.Host(ctx)
+	baseURL := fmt.Sprintf("http://%s:%s", host, port.Port())
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	for range 20 {
+		req, _ := http.NewRequest("GET", baseURL+"/", nil)
+		req.Host = "test.local"
+		resp, err := client.Do(req)
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}
+
+	resp, err := client.Get(baseURL + "/__drps/metrics")
+	if err != nil {
+		t.Fatalf("GET metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("metrics status=%d, want 200", resp.StatusCode)
+	}
+	var m struct {
+		ReqWorkConn struct {
+			Requested int64 `json:"requested"`
+			Sent      int64 `json:"sent"`
+		} `json:"req_work_conn"`
+		Pool struct {
+			GetHit      int64 `json:"get_hit"`
+			RefillSent  int64 `json:"refill_sent"`
+			ActivePools int64 `json:"active_pools"`
+		} `json:"pool"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		t.Fatalf("decode metrics: %v", err)
+	}
+	if m.ReqWorkConn.Requested <= 0 {
+		t.Fatalf("req_work_conn.requested=%d, want > 0", m.ReqWorkConn.Requested)
+	}
+	if m.ReqWorkConn.Sent <= 0 {
+		t.Fatalf("req_work_conn.sent=%d, want > 0", m.ReqWorkConn.Sent)
+	}
+	if m.Pool.GetHit <= 0 {
+		t.Fatalf("pool.get_hit=%d, want > 0", m.Pool.GetHit)
+	}
+}
+
+func TestHTTPConcurrentProxyNo5xx(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+
+	netw, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	defer netw.Remove(ctx)
+
+	backend := startBackend(ctx, t, netw.Name)
+	defer backend.Terminate(ctx)
+
+	drps := startDrps(ctx, t, netw.Name)
+	defer drps.Terminate(ctx)
+
+	frpcToml := `
+serverAddr = "drps"
+serverPort = 17000
+auth.token = "test-token"
+transport.tls.enable = false
+
+[[proxies]]
+name = "web"
+type = "http"
+localIP = "backend"
+localPort = 80
+customDomains = ["test.local"]
+`
+	frpc := startFrpc(ctx, t, netw.Name, frpcToml, "start proxy success")
+	defer frpc.Terminate(ctx)
+
+	port, _ := drps.MappedPort(ctx, "18080/tcp")
+	host, _ := drps.Host(ctx)
+	url := fmt.Sprintf("http://%s:%s/", host, port.Port())
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	total := 120
+	concurrency := 20
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var ok200 atomic.Int64
+	var non2xx atomic.Int64
+	var failed atomic.Int64
+
+	for range total {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			req, _ := http.NewRequest("GET", url, nil)
+			req.Host = "test.local"
+			resp, err := client.Do(req)
+			if err != nil {
+				failed.Add(1)
+				return
+			}
+			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
+			if resp.StatusCode == 200 {
+				ok200.Add(1)
+				return
+			}
+			non2xx.Add(1)
+		}()
+	}
+	wg.Wait()
+
+	if failed.Load() > 0 {
+		t.Fatalf("request failed=%d", failed.Load())
+	}
+	if non2xx.Load() > 0 {
+		t.Fatalf("non-2xx=%d", non2xx.Load())
+	}
+	if ok200.Load() != int64(total) {
+		t.Fatalf("ok200=%d, want %d", ok200.Load(), total)
+	}
+}
+
+func TestHTTPBurst1000NoNon2xx(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+
+	netw, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	defer netw.Remove(ctx)
+
+	backend := startBackend(ctx, t, netw.Name)
+	defer backend.Terminate(ctx)
+
+	drps := startDrps(ctx, t, netw.Name)
+	defer drps.Terminate(ctx)
+
+	frpcToml := `
+serverAddr = "drps"
+serverPort = 17000
+auth.token = "test-token"
+transport.tls.enable = false
+
+[[proxies]]
+name = "web"
+type = "http"
+localIP = "backend"
+localPort = 80
+customDomains = ["test.local"]
+`
+	frpc := startFrpc(ctx, t, netw.Name, frpcToml, "start proxy success")
+	defer frpc.Terminate(ctx)
+
+	port, _ := drps.MappedPort(ctx, "18080/tcp")
+	host, _ := drps.Host(ctx)
+	url := fmt.Sprintf("http://%s:%s/", host, port.Port())
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	total := 1000
+	concurrency := 50
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var non2xx atomic.Int64
+	var failed atomic.Int64
+
+	for range total {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			req, _ := http.NewRequest("GET", url, nil)
+			req.Host = "test.local"
+			resp, err := client.Do(req)
+			if err != nil {
+				failed.Add(1)
+				return
+			}
+			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				non2xx.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if failed.Load() > 0 {
+		t.Fatalf("request failed=%d", failed.Load())
+	}
+	if non2xx.Load() > 0 {
+		t.Fatalf("non-2xx=%d", non2xx.Load())
+	}
+}
+
+func TestWSBurst200NoFail(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+
+	netw, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	defer netw.Remove(ctx)
+
+	wsEcho := startWSEcho(ctx, t, netw.Name)
+	defer wsEcho.Terminate(ctx)
+
+	drps := startDrps(ctx, t, netw.Name)
+	defer drps.Terminate(ctx)
+
+	frpcToml := `
+serverAddr = "drps"
+serverPort = 17000
+auth.token = "test-token"
+transport.tls.enable = false
+
+[[proxies]]
+name = "bench-ws"
+type = "http"
+localIP = "ws-echo"
+localPort = 9090
+customDomains = ["ws.local"]
+`
+	frpc := startFrpc(ctx, t, netw.Name, frpcToml, "start proxy success")
+	defer frpc.Terminate(ctx)
+
+	port, _ := drps.MappedPort(ctx, "18080/tcp")
+	host, _ := drps.Host(ctx)
+	addr := net.JoinHostPort(host, port.Port())
+
+	total := 200
+	concurrency := 10
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var failed atomic.Int64
+
+	for range total {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := doRawWSEcho(addr, "ws.local"); err != nil {
+				failed.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if failed.Load() > 0 {
+		t.Fatalf("ws failed=%d/%d", failed.Load(), total)
+	}
+}
+
+func TestWSBurst500NoFail(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+
+	netw, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	defer netw.Remove(ctx)
+
+	wsEcho := startWSEcho(ctx, t, netw.Name)
+	defer wsEcho.Terminate(ctx)
+
+	drps := startDrps(ctx, t, netw.Name)
+	defer drps.Terminate(ctx)
+
+	frpcToml := `
+serverAddr = "drps"
+serverPort = 17000
+auth.token = "test-token"
+transport.tls.enable = false
+
+[[proxies]]
+name = "bench-ws"
+type = "http"
+localIP = "ws-echo"
+localPort = 9090
+customDomains = ["ws.local"]
+`
+	frpc := startFrpc(ctx, t, netw.Name, frpcToml, "start proxy success")
+	defer frpc.Terminate(ctx)
+
+	port, _ := drps.MappedPort(ctx, "18080/tcp")
+	host, _ := drps.Host(ctx)
+	addr := net.JoinHostPort(host, port.Port())
+
+	total := 500
+	concurrency := 10
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var failed atomic.Int64
+
+	for range total {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := doRawWSEcho(addr, "ws.local"); err != nil {
+				failed.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if failed.Load() > 0 {
+		t.Fatalf("ws failed=%d/%d", failed.Load(), total)
+	}
+}
+
+func TestMetricsInflightZeroAfterBurst(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+
+	netw, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	defer netw.Remove(ctx)
+
+	backend := startBackend(ctx, t, netw.Name)
+	defer backend.Terminate(ctx)
+
+	drps := startDrps(ctx, t, netw.Name)
+	defer drps.Terminate(ctx)
+
+	frpcToml := `
+serverAddr = "drps"
+serverPort = 17000
+auth.token = "test-token"
+transport.tls.enable = false
+
+[[proxies]]
+name = "web"
+type = "http"
+localIP = "backend"
+localPort = 80
+customDomains = ["test.local"]
+`
+	frpc := startFrpc(ctx, t, netw.Name, frpcToml, "start proxy success")
+	defer frpc.Terminate(ctx)
+
+	port, _ := drps.MappedPort(ctx, "18080/tcp")
+	host, _ := drps.Host(ctx)
+	baseURL := fmt.Sprintf("http://%s:%s", host, port.Port())
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	total := 300
+	concurrency := 30
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for range total {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			req, _ := http.NewRequest("GET", baseURL+"/", nil)
+			req.Host = "test.local"
+			resp, err := client.Do(req)
+			if err == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		}()
+	}
+	wg.Wait()
+	time.Sleep(400 * time.Millisecond)
+
+	resp, err := client.Get(baseURL + "/__drps/metrics")
+	if err != nil {
+		t.Fatalf("GET metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("metrics status=%d, want 200", resp.StatusCode)
+	}
+	var m struct {
+		ReqWorkConn struct {
+			Requested int64 `json:"requested"`
+			Sent      int64 `json:"sent"`
+			Inflight  int64 `json:"inflight"`
+		} `json:"req_work_conn"`
+		Pool struct {
+			GetHit     int64 `json:"get_hit"`
+			GetMiss    int64 `json:"get_miss"`
+			RefillSent int64 `json:"refill_sent"`
+		} `json:"pool"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		t.Fatalf("decode metrics: %v", err)
+	}
+	if m.ReqWorkConn.Requested <= 0 || m.ReqWorkConn.Sent <= 0 {
+		t.Fatalf("invalid req_work_conn counters: requested=%d sent=%d", m.ReqWorkConn.Requested, m.ReqWorkConn.Sent)
+	}
+	if m.ReqWorkConn.Inflight != 0 {
+		t.Fatalf("req_work_conn.inflight=%d, want 0 after burst", m.ReqWorkConn.Inflight)
+	}
+	if m.Pool.GetHit+m.Pool.GetMiss <= 0 {
+		t.Fatalf("pool get counters are zero")
+	}
+}
+
+// Aliases for docs/tests/*.md names
+func TestHTTPConcurrentProxy(t *testing.T) { TestHTTPConcurrentProxyNo5xx(t) }
+func TestHTTPLoadZeroErrors(t *testing.T)  { TestHTTPBurst1000NoNon2xx(t) }
+func TestWebSocketConcurrent(t *testing.T) { TestWSBurst200NoFail(t) }
+func TestMetricsEndpoint(t *testing.T)     { TestMetricsEndpointAfterTraffic(t) }
+func TestMetricsAfterLoad(t *testing.T)    { TestMetricsInflightZeroAfterBurst(t) }
+func TestIB(t *testing.T)                  { TestHTTPBurst1000NoNon2xx(t) }

@@ -76,7 +76,7 @@ func main() {
 				log.Printf("accept: %v", err)
 				continue
 			}
-			go handleTCP(conn, h)
+			go handleTCP(conn, h, cfg)
 		}
 	}()
 
@@ -88,13 +88,17 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-func handleTCP(conn net.Conn, h *server.Handler) {
-	cfg := yamux.DefaultConfig()
-	cfg.LogOutput = io.Discard
+func handleTCP(conn net.Conn, h *server.Handler, appCfg *config.Config) {
+	ycfg := yamux.DefaultConfig()
+	ycfg.LogOutput = io.Discard
 	// frps와 동일하게 스트림 윈도우를 크게 잡아 window-update 프레임 빈도를 낮춘다.
-	cfg.MaxStreamWindowSize = 6 * 1024 * 1024
+	ycfg.MaxStreamWindowSize = uint32(appCfg.YamuxMaxStreamWindow)
+	ycfg.AcceptBacklog = appCfg.YamuxAcceptBacklog
+	ycfg.EnableKeepAlive = appCfg.YamuxEnableKeepAlive
+	ycfg.KeepAliveInterval = time.Duration(appCfg.YamuxKeepAliveSeconds) * time.Second
+	ycfg.ConnectionWriteTimeout = time.Duration(appCfg.YamuxWriteTimeoutSec) * time.Second
 
-	session, err := yamux.Server(conn, cfg)
+	session, err := yamux.Server(conn, ycfg)
 	if err != nil {
 		log.Printf("yamux: %v", err)
 		conn.Close()

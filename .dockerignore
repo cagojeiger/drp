@@ -1,4 +1,6 @@
 .repos
+!.repos/frp
+!.repos/frp/**
 docs_legacy
 bin
 test

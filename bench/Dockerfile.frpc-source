@@ -1,0 +1,9 @@
+FROM golang:1.25-alpine AS build
+
+WORKDIR /src/frp
+COPY .repos/frp/ ./
+RUN go build -tags noweb -trimpath -ldflags="-s -w" -o /out/frpc ./cmd/frpc
+
+FROM alpine:3.20
+RUN apk add --no-cache netcat-openbsd
+COPY --from=build /out/frpc /usr/local/bin/frpc

@@ -1,0 +1,43 @@
+services:
+  backend:
+    image: nginx:alpine
+    networks:
+      - bench
+
+  ws-echo:
+    build:
+      context: ./ws-echo
+      dockerfile: Dockerfile
+    networks:
+      - bench
+
+  frps:
+    build:
+      context: .
+      dockerfile: Dockerfile.frp-release
+    entrypoint: ["frps", "-c", "/etc/frps/frps.toml"]
+    volumes:
+      - ./frps.toml:/etc/frps/frps.toml:ro
+    ports:
+      - "18080:28080"
+    networks:
+      - bench
+
+  frpc:
+    build:
+      context: .
+      dockerfile: Dockerfile.frp-release
+    depends_on:
+      - frps
+      - backend
+      - ws-echo
+    environment:
+      - FRP_SERVER_ADDR=frps
+    entrypoint: ["sh", "-c", "while ! nc -z frps 17000 2>/dev/null; do sleep 0.5; done && frpc -c /etc/frpc/frpc.toml"]
+    volumes:
+      - ./frpc.toml:/etc/frpc/frpc.toml:ro
+    networks:
+      - bench
+
+networks:
+  bench:

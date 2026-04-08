@@ -22,6 +22,11 @@ func Wrap(conn net.Conn, aesKey []byte, proxyName string, enc, comp bool) (net.C
 		return nil, err
 	}
 
+	// Fast path: no extra codec layer, use the raw connection directly.
+	if !enc && !comp {
+		return conn, nil
+	}
+
 	var r io.Reader = conn
 	var w io.Writer = conn
 	var closer io.Closer = conn

@@ -1,0 +1,50 @@
+services:
+  backend:
+    image: nginx:alpine
+    networks:
+      - bench
+
+  ws-echo:
+    build:
+      context: ./ws-echo
+      dockerfile: Dockerfile
+    networks:
+      - bench
+
+  drps:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      - DRPS_TOKEN=bench-token
+      - DRPS_FRPC_ADDR=:17000
+      - DRPS_HTTP_ADDR=:18080
+      - DRPS_PPROF=1
+      - DRPS_YAMUX_ACCEPT_BACKLOG=${DRPS_YAMUX_ACCEPT_BACKLOG:-256}
+      - DRPS_YAMUX_KEEPALIVE_ENABLE=${DRPS_YAMUX_KEEPALIVE_ENABLE:-true}
+      - DRPS_YAMUX_KEEPALIVE_SEC=${DRPS_YAMUX_KEEPALIVE_SEC:-30}
+      - DRPS_YAMUX_WRITE_TIMEOUT_SEC=${DRPS_YAMUX_WRITE_TIMEOUT_SEC:-10}
+      - DRPS_YAMUX_MAX_STREAM_WINDOW=${DRPS_YAMUX_MAX_STREAM_WINDOW:-6291456}
+    ports:
+      - "18080:18080"
+    networks:
+      - bench
+
+  frpc:
+    build:
+      context: ..
+      dockerfile: bench/Dockerfile.frpc-source
+    depends_on:
+      - drps
+      - backend
+      - ws-echo
+    environment:
+      - FRP_SERVER_ADDR=drps
+    entrypoint: ["sh", "-c", "while ! nc -z drps 17000 2>/dev/null; do sleep 0.5; done && frpc -c /etc/frpc/frpc.toml"]
+    volumes:
+      - ./frpc.toml:/etc/frpc/frpc.toml:ro
+    networks:
+      - bench
+
+networks:
+  bench:
