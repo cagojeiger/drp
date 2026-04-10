@@ -4,13 +4,36 @@ frpc v0.68.0 호환. frp 패키지 import 없이 직접 구현.
 
 ## 와이어 포맷
 
-```
-[1 byte: 타입코드] [8 bytes: int64 BE 길이] [N bytes: JSON 본문]
+```mermaid
+packet-beta
+  0-7: "Type (1B)"
+  8-71: "Length (8B, int64 BE)"
+  72-95: "JSON body (N bytes, max 10240)"
 ```
 
-최대 본문 크기: 10240 bytes.
+- 최대 본문 크기: **10240 bytes**
+- `length`는 int64 Big-Endian
+- 음수 length → 거부 (보안)
 
-### 타입코드
+## 메시지 타입 (10개)
+
+```mermaid
+flowchart LR
+    subgraph control["제어 채널 (암호화)"]
+        direction LR
+        Login["'o' Login"] --> LoginResp["'1' LoginResp"]
+        NewProxy["'p' NewProxy"] --> NewProxyResp["'2' NewProxyResp"]
+        CloseProxy["'c' CloseProxy"]
+        Ping["'h' Ping"] --> Pong["'4' Pong"]
+        ReqWorkConn["'r' ReqWorkConn"]
+    end
+
+    subgraph work["워크 커넥션 (평문)"]
+        direction LR
+        NewWorkConn["'w' NewWorkConn"]
+        StartWorkConn["'s' StartWorkConn"]
+    end
+```
 
 | 바이트 | 이름 | 방향 | 용도 |
 |--------|------|------|------|
@@ -25,91 +48,132 @@ frpc v0.68.0 호환. frp 패키지 import 없이 직접 구현.
 | `'h'` | Ping | frpc → drps | 하트비트 |
 | `'4'` | Pong | drps → frpc | 하트비트 응답 |
 
-### 구현
-
-`internal/msg` — ReadMsg, WriteMsg, 메시지 구조체 10개 (frp v0.68.0 필드 완전 일치)
-
-### 성능 설계
-
-**WriteMsg 버퍼링**: type(1B) + length(8B) + body(NB)를 단일 `[]byte`에 조립 후 1회 `Write` 호출. 기존 3회 개별 Write → 3 syscall 문제 해결.
-
-```
-기존: w.Write(type) → binary.Write(length) → w.Write(body)  // 3 syscall
-개선: buf = [type | length | body] → w.Write(buf)            // 1 syscall
-```
-
-**TypeOf 리플렉션 제거**: `fmt.Sprintf("%T", m)` 문자열 할당 대신 switch type assertion으로 타입 바이트 반환.
-
-```go
-// 기존: fmt.Sprintf("%T", m) → map lookup (매번 문자열 할당)
-// 개선: switch m.(type) → 직접 반환 (할당 없음)
-func TypeOf(m Message) (byte, bool) {
-    switch m.(type) {
-    case *Login:        return 'o', true
-    case *LoginResp:    return '1', true
-    ...
-    }
-}
-```
-
-**ReadMsg 버퍼 재사용**: 헤더 9바이트는 스택 할당 `[9]byte`. body 버퍼는 sync.Pool에서 가져와 재사용.
+구현: `internal/msg` — 10개 구조체 + ReadMsg/WriteMsg.
 
 ## 인증
 
+### 키 생성
+
+```mermaid
+flowchart LR
+    token[server token] --> concat
+    ts[timestamp<br/>unix 초] --> concat[concat]
+    concat --> md5[MD5]
+    md5 --> key[privilege_key<br/>32B hex]
 ```
-privilege_key = MD5(token + timestamp)
+
+### 검증 순서
+
+```mermaid
+sequenceDiagram
+    participant F as frpc
+    participant S as drps
+
+    F->>F: ts = now()
+    F->>F: key = MD5(token + ts)
+    F->>S: Login{PrivilegeKey: key, Timestamp: ts}
+    S->>S: expected = MD5(server_token + ts)
+    alt ConstantTimeCompare(key, expected)
+        S-->>F: LoginResp{Error: ""}
+        Note over S: AES 래핑 시작
+    else
+        S-->>F: LoginResp{Error: "auth failed"}
+        S->>S: conn.Close
+    end
 ```
 
-- Login 시 frpc가 `privilege_key` + `timestamp` 전송
-- drps가 `MD5(server_token + timestamp)` 계산 후 constant-time 비교
-- 인증 실패 → LoginResp.Error + 연결 종료
-
-### 구현
-
-`internal/auth` — BuildAuthKey, VerifyAuth (`crypto/md5` + `crypto/subtle`)
+구현: `internal/auth` — `crypto/md5` + `crypto/subtle.ConstantTimeCompare`.
 
 ## 암호화 (AES-128-CFB)
 
 ### 키 파생
 
-```
-key = PBKDF2(token, salt="frp", iter=64, keyLen=16, sha1)
-```
-
-- frp의 golib 소스와 파라미터 1:1 대조 완료
-- `DefaultSalt = "crypto"` → frp가 init()에서 `"frp"`로 덮어씀
-- **서버 시작 시 1회만 계산**, 이후 캐시된 키를 wrap/server에 전달
-
-### IV 전송
-
-```
-Writer: 첫 Write 시 랜덤 IV(16바이트) 선행 전송
-Reader: 첫 Read 시 IV(16바이트) 선행 수신
+```mermaid
+flowchart LR
+    token[token] --> pbkdf2
+    salt["salt = 'frp'"] --> pbkdf2
+    iter["iter = 64"] --> pbkdf2
+    len["keyLen = 16"] --> pbkdf2
+    hash["hash = sha1"] --> pbkdf2
+    pbkdf2[PBKDF2] --> key[aesKey 16B]
+    key -.->|서버 시작 시 1회| cache["proxy.Handler.aesKey<br/>(캐시)"]
 ```
 
-Reader/Writer 독립 IV (양방향 각각).
+`DefaultSalt = "crypto"`는 frp가 `init()`에서 `"frp"`로 덮어씀. drps는 처음부터 `"frp"` 사용.
 
-### 사용 위치
+### IV 전송 규칙
+
+```mermaid
+sequenceDiagram
+    participant W as Writer
+    participant R as Reader
+    W->>W: 첫 Write 시 rand 16B IV 생성
+    W->>R: IV (16B)
+    W->>R: encrypted data...
+    R->>R: 첫 Read 시 IV 16B 수신
+    R->>R: cipher 초기화
+    Note over W,R: Writer/Reader 독립 IV (양방향 각각)
+```
+
+### 적용 위치
 
 | 위치 | 적용 시점 | 키 소스 |
 |------|----------|---------|
-| 제어 채널 | Login 성공 후 (항상) | 캐시된 키 |
-| 워크 커넥션 | UseEncryption=true 시 (선택) | 캐시된 키 |
+| 제어 채널 | Login 성공 후 (항상) | `crypto.DeriveKey(token)` (로그인 시 계산) |
+| 워크 커넥션 | `UseEncryption=true` (선택) | 서버 시작 시 계산된 캐시 키 (`proxy.Handler.aesKey`) |
 
 ## 압축 (snappy)
 
-- frpc의 `UseCompression=true` 시 적용
-- 동일 라이브러리 (`github.com/golang/snappy`)
-- Write마다 자동 Flush (양방향 통신 데드락 방지)
+`UseCompression=true` 시 적용. 동일 라이브러리 (`github.com/golang/snappy`). **Write마다 자동 Flush** (양방향 통신 데드락 방지).
 
-### 래핑 순서
+## 래핑 순서
 
+drps ↔ frpc 양쪽 동일.
+
+```mermaid
+flowchart LR
+    conn[raw conn] --> aes[AES-128-CFB]
+    aes --> snappy[snappy]
+    snappy --> http[HTTP 바이트]
 ```
-conn → [AES-128-CFB] → [snappy] → HTTP 바이트
+
+제어 채널: `conn → AES → 제어 메시지`
+워크 커넥션: `conn → StartWorkConn(평문) → [AES?] → [snappy?] → HTTP`
+
+## 성능 설계
+
+### WriteMsg 단일 버퍼
+
+```mermaid
+flowchart TB
+    subgraph old["기존 (3 syscall)"]
+        direction LR
+        o1[w.Write type] --> o2[binary.Write length] --> o3[w.Write body]
+    end
+    subgraph new["개선 (1 syscall)"]
+        direction LR
+        n1["buf = [type | length | body]"] --> n2[w.Write buf]
+    end
+    old -.-> new
 ```
 
-drps와 frpc 양쪽 동일.
+### TypeOf 리플렉션 제거
 
-### 구현
+```go
+// 기존: fmt.Sprintf("%T", m) → map lookup (문자열 할당)
+// 개선: switch type assertion (0 allocs)
+func TypeOf(m Message) (byte, bool) {
+    switch m.(type) {
+    case *Login:     return 'o', true
+    case *LoginResp: return '1', true
+    // ...
+    }
+}
+```
 
-`internal/crypto` — DeriveKey, NewCryptoWriter/Reader, NewSnappyWriter/Reader
+### ReadMsg 버퍼 재사용
+
+- 헤더 9바이트: 스택 할당 `[9]byte`
+- Body 버퍼: `sync.Pool` 재사용
+
+구현: `internal/msg`, `internal/auth`, `internal/crypto`

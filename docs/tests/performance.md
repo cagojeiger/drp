@@ -1,6 +1,6 @@
 # 성능 테스트
 
-벤치마크 13개. 리팩토링 전후 비교 및 회귀 방지 목적.
+벤치마크 9개. 리팩토링 전후 비교 및 회귀 방지 목적.
 
 ## 실행
 
@@ -75,7 +75,9 @@ func BenchmarkDeriveKey(b *testing.B) {
 **기대**: ~50us/op 이상. 이 수치가 매 HTTP 요청마다 반복되면 병목.
 캐싱 후에는 이 비용이 서버 시작 시 1회로 제한.
 
-## proxy 벤치마크 (3) — internal/proxy
+## proxy 벤치마크 — 미구현 후보
+
+아래는 향후 추가 고려 대상. 현재 코드에 미구현.
 
 | ID | 벤치마크 | 개선 포인트 | 기대 효과 |
 |----|---------|------------|----------|
@@ -83,18 +85,17 @@ func BenchmarkDeriveKey(b *testing.B) {
 | B-X-03 | BenchmarkWrap | 캐시 키 사용 | DeriveKey 제거 효과 |
 | B-X-04 | BenchmarkConnTransportRoundTrip | bufio sync.Pool 재사용 | allocs/op 감소 |
 
-## pool 벤치마크 (3) — internal/pool
+## pool 벤치마크 (2) — internal/pool
 
 | ID | 벤치마크 | 개선 포인트 | 기대 효과 |
 |----|---------|------------|----------|
 | B-X-02 | BenchmarkPoolGetPut | Get/Put 사이클 | 기준선 |
-| B-X-05 | BenchmarkPoolLookupByRunID | RunID 직접 vs RangeByProxy | O(1) vs O(N) 차이 |
-| B-P-01 | BenchmarkPoolGetEagerRefill | Get 후 eager refill 비용 | goroutine 생성 오버헤드 측정 |
+| B-X-05 | BenchmarkRegistryGet | Registry.Get RunID 직접 조회 | O(1) — 프록시 수와 무관 |
 
 ### B-X-05 검증 방법
 
 ```go
-func BenchmarkPoolLookupByRunID(b *testing.B) {
+func BenchmarkRegistryGet(b *testing.B) {
     reg := pool.NewRegistry()
     for i := 0; i < 100; i++ {
         reg.GetOrCreate(fmt.Sprintf("run-%d", i), func() {})
