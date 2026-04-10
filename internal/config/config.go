@@ -11,6 +11,7 @@ type Config struct {
 	FrpcAddr              string
 	HTTPAddr              string
 	PoolCapacity          int
+	ResponseTimeoutSec    int
 	YamuxAcceptBacklog    int
 	YamuxEnableKeepAlive  bool
 	YamuxKeepAliveSeconds int
@@ -24,6 +25,7 @@ func Load() *Config {
 		FrpcAddr:              ":17000",
 		HTTPAddr:              ":18080",
 		PoolCapacity:          64,
+		ResponseTimeoutSec:    0,
 		YamuxAcceptBacklog:    256,
 		YamuxEnableKeepAlive:  true,
 		YamuxKeepAliveSeconds: 30,
@@ -35,6 +37,7 @@ func Load() *Config {
 	flag.StringVar(&c.FrpcAddr, "frpc-addr", c.FrpcAddr, "frpc listener address")
 	flag.StringVar(&c.HTTPAddr, "http-addr", c.HTTPAddr, "HTTP listener address")
 	flag.IntVar(&c.PoolCapacity, "pool-capacity", c.PoolCapacity, "work connection pool capacity")
+	flag.IntVar(&c.ResponseTimeoutSec, "response-timeout-sec", c.ResponseTimeoutSec, "upstream response timeout seconds (0 disables)")
 	flag.IntVar(&c.YamuxAcceptBacklog, "yamux-accept-backlog", c.YamuxAcceptBacklog, "yamux accept backlog")
 	flag.BoolVar(&c.YamuxEnableKeepAlive, "yamux-keepalive-enable", c.YamuxEnableKeepAlive, "yamux keepalive enable")
 	flag.IntVar(&c.YamuxKeepAliveSeconds, "yamux-keepalive-sec", c.YamuxKeepAliveSeconds, "yamux keepalive interval seconds")
@@ -54,6 +57,11 @@ func Load() *Config {
 	if v := os.Getenv("DRPS_POOL_CAPACITY"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c.PoolCapacity = n
+		}
+	}
+	if v := os.Getenv("DRPS_RESPONSE_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.ResponseTimeoutSec = n
 		}
 	}
 	if v := os.Getenv("DRPS_YAMUX_ACCEPT_BACKLOG"); v != "" {

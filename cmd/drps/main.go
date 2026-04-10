@@ -50,6 +50,9 @@ func main() {
 	proxyHandler := proxy.NewHandler(rt, func(runID string) (*pool.Pool, bool) {
 		return registry.Get(runID)
 	}, aesKey)
+	if cfg.ResponseTimeoutSec > 0 {
+		proxyHandler.ResponseTimeout = time.Duration(cfg.ResponseTimeoutSec) * time.Second
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/__drps/metrics", server.MetricsHandler(reqStats, registry.AggregateStats))
 	if os.Getenv("DRPS_PPROF") == "1" {
