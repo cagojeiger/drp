@@ -2,11 +2,13 @@
 
 최종 업데이트: 2026-04-08 (KST)
 
-이 문서는 `bench/run.sh`로 실제 실행한 벤치/튜닝 실험 이력을 기록한다.
+이 문서는 과거 `bench/run.sh` 기반 벤치/튜닝 실험 이력을 기록한다.
+현재 이 저장소에는 `bench/` 디렉터리가 포함되어 있지 않다.
 
 ## 0) 측정 구조
 
 ```text
+(과거 외부 벤치 환경)
 bench/run.sh
   ├─ drps 시나리오
   │   ├─ HTTP(hey)
@@ -139,7 +141,7 @@ frps goodput_200_rps = 1202.20 ± 142.93
 
 - `duration` 모드에서는 기존 에러 집계 로직이 non-2xx를 누락할 수 있어 보정했다.
 - 관련 파일:
-  - `/Users/kangheeyong/project/drp/bench/run.sh`
+  - `/Users/kangheeyong/project/drp/bench/run.sh` (현재 저장소에는 미포함)
 
 ## 7) 다음 권장 측정
 
@@ -148,4 +150,3 @@ frps goodput_200_rps = 1202.20 ± 142.93
 2) WS 연결 전용(conn/s)
 3) WS 메시지 전용(reuse, msg/s)
 ```
-

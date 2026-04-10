@@ -98,7 +98,7 @@ func startWSEcho(ctx context.Context, t *testing.T, netName string) testcontaine
 	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
 			FromDockerfile: testcontainers.FromDockerfile{
-				Context:    "../bench/ws-echo",
+				Context:    "ws-echo",
 				Dockerfile: "Dockerfile",
 			},
 			ExposedPorts: []string{"9090/tcp"},
