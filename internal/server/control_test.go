@@ -66,15 +66,26 @@ func TestControlReqWorkConn(t *testing.T) {
 	// frpc: Login + AES 래핑
 	reader, _ := frpcLogin(t, clientConn, "test-token", "run-1", 3)
 
-	// Login 후 drps가 ReqWorkConn을 PoolCount(3)번 보내야 함
-	for i := range 3 {
+	// Login 후 drps가 요청한 총 ReqWorkConn 수가 PoolCount(3)인지 검증.
+	// sendLoop 배칭으로 메시지 개수는 1~N개가 될 수 있으므로 Count를 합산한다.
+	total := 0
+	for total < 3 {
 		m, err := msg.ReadMsg(reader)
 		if err != nil {
-			t.Fatalf("read ReqWorkConn[%d]: %v", i, err)
+			t.Fatalf("read ReqWorkConn(total=%d): %v", total, err)
 		}
-		if _, ok := m.(*msg.ReqWorkConn); !ok {
+		r, ok := m.(*msg.ReqWorkConn)
+		if !ok {
 			t.Fatalf("expected *ReqWorkConn, got %T", m)
 		}
+		c := r.Count
+		if c == 0 {
+			c = 1
+		}
+		total += c
+	}
+	if total != 3 {
+		t.Fatalf("total ReqWorkConn count = %d, want 3", total)
 	}
 }
 
