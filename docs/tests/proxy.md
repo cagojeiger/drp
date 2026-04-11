@@ -1,6 +1,6 @@
 # 프록시 테스트
 
-`internal/proxy`, `internal/wrap`, `internal/pool` 대상. 27개 + 추가 6개 + 벤치마크 5개.
+`internal/proxy`, `internal/wrap`, `internal/pool` 대상. 29개 + 추가 6개 + 벤치마크 5개.
 
 ## 워크 커넥션 풀 (6) — internal/pool
 
@@ -52,6 +52,13 @@
 |----|--------|--------|------|
 | X-17 | TestProxyPoolLookupByRunID | P0 | poolLookup(cfg.RunID) 직접 호출 → RangeByProxy 미사용 확인 |
 
+## Transport 커넥션 풀 격리 (2) — internal/proxy
+
+| ID | 테스트 | 중요도 | 검증 |
+|----|--------|--------|------|
+| X-20 | TestURLHostKeyingIsolation | P0 | 같은 도메인 다른 Location/ProxyName → synthetic URL.Host 값이 서로 다름 |
+| X-21 | TestURLHostKeyingViaProxy | P0 | 두 라우트 경유 요청 → 각각 독립 커넥션 풀로 200 응답 |
+
 ## 암호화/압축 통합 (3) — internal/proxy
 
 | ID | 테스트 | 중요도 | 검증 |
@@ -90,12 +97,11 @@
 | X-18 | TestWebSocketBothGoroutinesComplete | P0 | 양쪽 relay goroutine 모두 종료 확인 (goroutine leak 방지) |
 | X-19 | TestWebSocketServerClose | P1 | 서버 측 먼저 닫기 → 클라이언트 goroutine도 종료 |
 
-## 벤치마크 — internal/proxy, internal/pool
+## 벤치마크 — internal/pool
 
 | ID | 벤치마크 | 검증 |
 |----|---------|------|
-| B-X-01 | BenchmarkServeHTTP | 전체 hot path throughput (요청 → 응답) |
 | B-X-02 | BenchmarkPoolGetPut | Pool Get/Put 사이클 성능 |
-| B-X-03 | BenchmarkWrap | Wrap (캐시 키) 성능 |
-| B-X-04 | BenchmarkConnTransportRoundTrip | connTransport bufio 재사용 효과 |
-| B-X-05 | BenchmarkPoolLookupByRunID | RunID 직접 조회 vs 기존 RangeByProxy 비교 |
+| B-X-05 | BenchmarkRegistryGet | Registry.Get RunID 직접 조회 O(1) |
+
+미구현 후보 (performance.md 참고): BenchmarkServeHTTP, BenchmarkWrap, BenchmarkConnTransportRoundTrip.

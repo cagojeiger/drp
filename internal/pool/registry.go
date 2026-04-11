@@ -10,6 +10,15 @@ type Registry struct {
 	pools map[string]*Pool // proxyName → Pool
 }
 
+type AggregateStats struct {
+	ActivePools  int   `json:"active_pools"`
+	GetHit       int64 `json:"get_hit"`
+	GetMiss      int64 `json:"get_miss"`
+	GetTimeout   int64 `json:"get_timeout"`
+	RefillDemand int64 `json:"refill_demand"`
+	RefillSent   int64 `json:"refill_sent"`
+}
+
 func NewRegistry() *Registry {
 	return &Registry{
 		pools: make(map[string]*Pool),
@@ -56,4 +65,21 @@ func (r *Registry) Range(fn func(name string, p *Pool) bool) {
 			return
 		}
 	}
+}
+
+func (r *Registry) AggregateStats() AggregateStats {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var out AggregateStats
+	out.ActivePools = len(r.pools)
+	for _, p := range r.pools {
+		s := p.Stats()
+		out.GetHit += s.GetHit
+		out.GetMiss += s.GetMiss
+		out.GetTimeout += s.GetTimeout
+		out.RefillDemand += s.RefillDemand
+		out.RefillSent += s.RefillSent
+	}
+	return out
 }

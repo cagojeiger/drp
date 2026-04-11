@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sync"
 )
 
 const headerSize = 9 // 1 byte type + 8 bytes length
 
 const MaxBodySize = 10240
+const maxPooledBufSize = 64 * 1024
 
 // Message is the interface all frp protocol messages implement.
 type Message interface {
@@ -32,6 +34,12 @@ var (
 	}
 
 	msgToType = map[string]byte{}
+	bufPool   = sync.Pool{
+		New: func() any {
+			b := make([]byte, 0, 4096)
+			return &b
+		},
+	}
 )
 
 func init() {
@@ -81,11 +89,22 @@ func WriteMsg(w io.Writer, m Message) error {
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	buf := make([]byte, headerSize+len(body))
+	bufPtr := bufPool.Get().(*[]byte)
+	buf := *bufPtr
+	need := headerSize + len(body)
+	if cap(buf) < need {
+		buf = make([]byte, need)
+	} else {
+		buf = buf[:need]
+	}
 	buf[0] = typeByte
 	binary.BigEndian.PutUint64(buf[1:headerSize], uint64(len(body)))
 	copy(buf[headerSize:], body)
 	_, err = w.Write(buf)
+	if cap(buf) <= maxPooledBufSize {
+		*bufPtr = buf[:0]
+		bufPool.Put(bufPtr)
+	}
 	return err
 }
 
@@ -96,10 +115,11 @@ func ReadMsg(r io.Reader) (Message, error) {
 		return nil, err
 	}
 
-	var length int64
-	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+	var lenBuf [8]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		return nil, err
 	}
+	length := int64(binary.BigEndian.Uint64(lenBuf[:]))
 	if length < 0 || length > MaxBodySize {
 		return nil, fmt.Errorf("invalid message body size: %d (max %d)", length, MaxBodySize)
 	}
@@ -109,14 +129,33 @@ func ReadMsg(r io.Reader) (Message, error) {
 		return nil, fmt.Errorf("unknown message type byte: 0x%02x", typeBuf[0])
 	}
 
-	body := make([]byte, length)
+	bodyPtr := bufPool.Get().(*[]byte)
+	body := *bodyPtr
+	need := int(length)
+	if cap(body) < need {
+		body = make([]byte, need)
+	} else {
+		body = body[:need]
+	}
 	if _, err := io.ReadFull(r, body); err != nil {
+		if cap(body) <= maxPooledBufSize {
+			*bodyPtr = body[:0]
+			bufPool.Put(bodyPtr)
+		}
 		return nil, err
 	}
 
 	msg := fn()
 	if err := json.Unmarshal(body, msg); err != nil {
+		if cap(body) <= maxPooledBufSize {
+			*bodyPtr = body[:0]
+			bufPool.Put(bodyPtr)
+		}
 		return nil, fmt.Errorf("unmarshal: %w", err)
+	}
+	if cap(body) <= maxPooledBufSize {
+		*bodyPtr = body[:0]
+		bufPool.Put(bodyPtr)
 	}
 	return msg, nil
 }
@@ -144,25 +183,25 @@ type LoginResp struct {
 }
 
 type NewProxy struct {
-	ProxyName         string            `json:"proxy_name,omitempty"`
-	ProxyType         string            `json:"proxy_type,omitempty"`
-	UseEncryption     bool              `json:"use_encryption,omitempty"`
-	UseCompression    bool              `json:"use_compression,omitempty"`
-	BandwidthLimit    string            `json:"bandwidth_limit,omitempty"`
-	BandwidthLimitMode string           `json:"bandwidth_limit_mode,omitempty"`
-	Group             string            `json:"group,omitempty"`
-	GroupKey          string            `json:"group_key,omitempty"`
-	Metas             map[string]string `json:"metas,omitempty"`
-	Annotations       map[string]string `json:"annotations,omitempty"`
-	CustomDomains     []string          `json:"custom_domains,omitempty"`
-	SubDomain         string            `json:"subdomain,omitempty"`
-	Locations         []string          `json:"locations,omitempty"`
-	HTTPUser          string            `json:"http_user,omitempty"`
-	HTTPPwd           string            `json:"http_pwd,omitempty"`
-	HostHeaderRewrite string            `json:"host_header_rewrite,omitempty"`
-	Headers           map[string]string `json:"headers,omitempty"`
-	ResponseHeaders   map[string]string `json:"response_headers,omitempty"`
-	RouteByHTTPUser   string            `json:"route_by_http_user,omitempty"`
+	ProxyName          string            `json:"proxy_name,omitempty"`
+	ProxyType          string            `json:"proxy_type,omitempty"`
+	UseEncryption      bool              `json:"use_encryption,omitempty"`
+	UseCompression     bool              `json:"use_compression,omitempty"`
+	BandwidthLimit     string            `json:"bandwidth_limit,omitempty"`
+	BandwidthLimitMode string            `json:"bandwidth_limit_mode,omitempty"`
+	Group              string            `json:"group,omitempty"`
+	GroupKey           string            `json:"group_key,omitempty"`
+	Metas              map[string]string `json:"metas,omitempty"`
+	Annotations        map[string]string `json:"annotations,omitempty"`
+	CustomDomains      []string          `json:"custom_domains,omitempty"`
+	SubDomain          string            `json:"subdomain,omitempty"`
+	Locations          []string          `json:"locations,omitempty"`
+	HTTPUser           string            `json:"http_user,omitempty"`
+	HTTPPwd            string            `json:"http_pwd,omitempty"`
+	HostHeaderRewrite  string            `json:"host_header_rewrite,omitempty"`
+	Headers            map[string]string `json:"headers,omitempty"`
+	ResponseHeaders    map[string]string `json:"response_headers,omitempty"`
+	RouteByHTTPUser    string            `json:"route_by_http_user,omitempty"`
 }
 
 type NewProxyResp struct {
@@ -175,7 +214,9 @@ type CloseProxy struct {
 	ProxyName string `json:"proxy_name,omitempty"`
 }
 
-type ReqWorkConn struct{}
+type ReqWorkConn struct {
+	Count int `json:"count,omitempty"`
+}
 
 type NewWorkConn struct {
 	RunID        string `json:"run_id,omitempty"`

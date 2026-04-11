@@ -2,105 +2,163 @@
 
 ## 요청 처리 흐름
 
-```
-클라이언트 → HTTP :httpAddr → drps
-  1. Router.Lookup(Host, Path) → RouteConfig (RunID 포함)
-  2. Basic Auth 검증 (HTTPUser 설정 시)
-  3. poolLookup(cfg.RunID) → Pool 직접 획득 (이중 조회 없음)
-  4. Pool.Get() → 워크 커넥션 획득
-  5. wrap.Wrap(conn, cachedKey, ...) → StartWorkConn + 암호화/압축 (캐시된 키)
-  6. Custom Headers 주입
-  7. HostHeaderRewrite 적용
-  8. req.Write → frpc → 백엔드
-  9. http.ReadResponse → 클라이언트에 전달 (bufio sync.Pool 재사용)
-  10. Response Headers 주입
-  11. 워크 커넥션 닫기 + eager refill
+```mermaid
+flowchart TB
+    req[HTTP 요청<br/>Host+Path] --> lookup[Router.Lookup]
+    lookup -->|RouteConfig| auth{Basic Auth?}
+    auth -->|미설정| pool
+    auth -->|pass| pool
+    auth -->|fail| r401[401 Unauthorized]
+
+    pool[poolLookup cfg.RunID] --> get[Pool.Get timeout]
+    get -->|miss| burst[burst refill<br/>ReqWorkConn]
+    burst --> wait[대기]
+    wait --> conn
+    get -->|hit| conn[work conn]
+
+    conn --> wrap[wrap.Wrap<br/>StartWorkConn + AES/snappy]
+    wrap --> rp[httputil.ReverseProxy]
+    rp --> rewrite[Rewrite<br/>Host rewrite + custom headers<br/>URL.Host keying]
+    rewrite --> send[DialContext 경유 요청 전달]
+    send --> resp[응답 수신]
+    resp --> modify[ModifyResponse<br/>response headers]
+    modify --> relay[클라이언트로 응답 전달]
+    relay --> close[conn.Close]
+
+    resp -->|101| ws[WebSocket 업그레이드 터널링<br/>ReverseProxy 기본 처리]
 ```
 
-### 이전 대비 변경점
+## 핵심 최적화
 
-| 항목 | 이전 | 이후 |
+| 항목 | 이전 | 개선 |
 |------|------|------|
-| Pool 조회 | poolLookup(proxyName) → RangeByProxy O(N) → runID → Get | poolLookup(cfg.RunID) → Get O(1) |
-| AES 키 | 매 요청 DeriveKey(token) PBKDF2 계산 | 서버 시작 시 1회 계산, 캐시 전달 |
-| bufio.Reader | 매 요청 새로 할당 | sync.Pool 재사용 |
-| WriteMsg | 3회 Write (3 syscall) | 1회 Write (1 syscall) |
+| Pool 조회 | proxyName → RangeByProxy O(N) → runID → Get | **cfg.RunID → Get O(1)** |
+| AES 키 | 매 요청 DeriveKey (PBKDF2) | **시작 시 1회 계산, 캐시 전달** |
+| 응답 바디 버퍼 | 매 요청 임시 버퍼 | **ReverseProxy BufferPool 재사용** |
+| 라우트 격리 | 주소 충돌 가능 | **synthetic URL.Host keying으로 라우트별 idle conn 격리** |
+| HTTP/2 cleartext | 미지원 | **h2c.NewHandler 기반 지원** |
+| WriteMsg | 3 syscall | **1 syscall** |
 
 ## 워크 커넥션 풀
 
-- RunID 기반 풀 관리 (하나의 frpc = 하나의 풀)
-- capacity: 설정 가능 (기본 64)
-- **Get**: 즉시 시도 → 없으면 ReqWorkConn 전송 → 대기 → 타임아웃
-- **eager refill**: Get 성공 후 비동기로 ReqWorkConn 전송
+```mermaid
+flowchart LR
+    frpc[frpc] -->|NewWorkConn| put[Pool.Put]
+    put --> ch[(channel<br/>capacity=64)]
+    ch --> get[Pool.Get]
+    get --> use[HTTP 요청 처리]
+    use --> eager[eager refill<br/>ReqWorkConn async]
+    eager --> frpc
+
+    miss[Get miss] --> burst[burst<br/>max 2,min 8,cap/4]
+    burst --> worker[refillWorker]
+    worker -->|N signals| reqCh[(reqCh)]
+    reqCh --> sendLoop
+    sendLoop -->|ReqWorkConn batch| frpc
+```
+
+**Burst refill**: pool이 비어있을 때 1개가 아니라 N개를 한꺼번에 요청 → 지연 감소.
 
 ### StartWorkConn
 
-워크 커넥션을 꺼낸 후 frpc에 전송하는 첫 메시지.
+워크 커넥션을 꺼낸 후 frpc에 보내는 첫 메시지.
 
-```
-StartWorkConn {proxy_name} → 평문으로 전송
-이후 UseEncryption → AES 래핑 (캐시된 키 사용)
-이후 UseCompression → snappy 래핑
-이후 HTTP 바이트 교환
+```mermaid
+flowchart LR
+    pool[Pool.Get] --> swc[StartWorkConn<br/>proxy_name 평문]
+    swc --> enc{UseEncryption?}
+    enc -->|yes| aes[AES 래핑<br/>cached key]
+    enc -->|no| comp
+    aes --> comp{UseCompression?}
+    comp -->|yes| snap[snappy 래핑]
+    comp -->|no| http[HTTP 바이트]
+    snap --> http
 ```
 
 ## Basic Auth
 
-```
-RouteConfig.HTTPUser가 설정된 경우:
-  → Authorization 헤더 없음 → 401 + WWW-Authenticate
-  → user/pass 불일치 → 401
-  → 일치 → 통과
+```mermaid
+flowchart TB
+    req[요청] --> set{HTTPUser<br/>설정됨?}
+    set -->|no| pass[통과]
+    set -->|yes| hdr{Authorization<br/>헤더?}
+    hdr -->|없음| h401[401 + WWW-Authenticate]
+    hdr -->|있음| verify{user/pass<br/>일치?}
+    verify -->|no| v401[401]
+    verify -->|yes| pass
 ```
 
 ## 헤더 조작
 
-### 요청 → 백엔드
-
-| 기능 | 설정 | 동작 |
-|------|------|------|
-| HostHeaderRewrite | `host_header_rewrite` | Host 헤더 변경 |
-| Custom Headers | `headers` | 요청에 헤더 추가/덮어쓰기 |
-
-### 백엔드 → 응답
-
-| 기능 | 설정 | 동작 |
-|------|------|------|
-| Response Headers | `response_headers` | 응답에 헤더 추가/덮어쓰기 |
+```mermaid
+flowchart LR
+    subgraph in["요청 → 백엔드"]
+        direction TB
+        i1[HostHeaderRewrite<br/>Host 변경]
+        i2[Custom Headers<br/>headers 추가/덮어쓰기]
+    end
+    subgraph out["백엔드 → 응답"]
+        direction TB
+        o1[Response Headers<br/>response_headers 추가/덮어쓰기]
+    end
+    client --> in --> backend --> out --> client
+```
 
 ## WebSocket
 
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant D as drps
+    participant F as frpc
+    participant B as Backend
+
+    C->>D: GET /ws Upgrade:websocket
+    D->>F: (via work conn) 요청 전달
+    F->>B: 요청 전달
+    B-->>F: 101 Switching Protocols
+    F-->>D: 101
+    D->>D: ReverseProxy 업그레이드 처리
+    D-->>C: 101 + 이후 바이트 터널링
 ```
-클라이언트 → GET /ws Upgrade:websocket → drps
-drps → 워크 커넥션으로 전달 → frpc → 백엔드
-백엔드 → 101 Switching Protocols
-drps → Hijack → 양방향 raw byte relay
-양쪽 goroutine 모두 완료 대기 후 정리
+
+drps는 별도 `handleUpgrade` 함수를 두지 않고 `httputil.ReverseProxy` 경로에서 업그레이드를 처리한다.
+
+## URL.Host keying
+
+ReverseProxy는 `Transport` 커넥션 재사용 키로 `URL.Host`를 사용한다.  
+drps는 다음 synthetic host를 사용해 라우트 단위로 idle connection pool을 분리한다.
+
+```text
+{Domain}.{Location}.{ProxyName}.drps
+예) app.example.com./api.web.drps
 ```
 
-- 101 응답 감지 → 클라이언트 연결을 Hijack
-- 이후 양방향 io.Copy (drps는 바이트를 그대로 전달)
-- 양쪽 relay goroutine이 모두 종료된 후 연결 닫기 (goroutine leak 방지)
+이 키는 네트워크 목적지가 아니며, 실제 연결은 `DialContext`에서 워크 커넥션을 직접 가져와 처리한다.
 
-## 에러 처리
+## 에러 매핑
 
-| 상황 | HTTP 상태 |
-|------|-----------|
-| 도메인 미등록 | 404 Not Found |
-| Basic Auth 실패 | 401 Unauthorized |
-| 풀 없음 / 워크 커넥션 획득 실패 | 502 Bad Gateway |
-| 래핑 실패 | 502 Bad Gateway |
-| 백엔드 무응답 (타임아웃) | 504 Gateway Timeout |
+```mermaid
+flowchart LR
+    miss[도메인 미등록] --> e404[404 Not Found]
+    ba[Basic Auth 실패] --> e401[401 Unauthorized]
+    np[풀 없음] --> e502[502 Bad Gateway]
+    wf[래핑 실패] --> e502
+    nr[백엔드 무응답] --> e504[504 Gateway Timeout]
+```
 
 ## 타임아웃
 
 | 타임아웃 | 기본값 | 설명 |
 |---------|--------|------|
-| WorkConnTimeout | 10초 | 풀에서 워크 커넥션 대기 |
-| ResponseTimeout | 설정 가능 | 백엔드 응답 대기 |
+| `WorkConnTimeout` | 10초 | 풀에서 워크 커넥션 대기 |
+| `ResponseTimeout` | 0(비활성) | wrapped conn 전체 I/O deadline (`DRPS_RESPONSE_TIMEOUT_SEC`로 설정) |
+| `ResponseHeaderTimeout` | 60초 | ReverseProxy Transport 응답 헤더 대기 |
+| `IdleConnTimeout` | 60초 | ReverseProxy idle conn 유지 시간 |
+| `MaxIdleConnsPerHost` | 5 | synthetic host 키당 idle conn 개수 |
+| `ReadHeaderTimeout` | 60초 | HTTP 헤더 읽기 (slowloris 방지) |
 
-### 구현
-
-`internal/proxy` — Handler.ServeHTTP, connTransport, handleUpgrade
-`internal/wrap` — Wrap (StartWorkConn + AES + snappy)
-`internal/pool` — Pool, Registry
+구현:
+- `internal/proxy` — Handler.ServeHTTP, ReverseProxy(Rewrite/ModifyResponse/DialContext)
+- `internal/wrap` — Wrap
+- `internal/pool` — Pool, Registry, refillWorker

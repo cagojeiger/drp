@@ -145,9 +145,8 @@ func TestGetMultipleEagerRefill(t *testing.T) {
 	}
 
 	time.Sleep(50 * time.Millisecond)
-	// With atomic refill guard, concurrent Gets coalesce refill requests.
-	// At least 1 refill must be triggered, but not necessarily 3.
-	if reqCount.Load() < 1 {
-		t.Errorf("RequestConn called %d times, want >= 1", reqCount.Load())
+	// Refill demand should not be dropped.
+	if reqCount.Load() != 3 {
+		t.Errorf("RequestConn called %d times, want 3", reqCount.Load())
 	}
 }
