@@ -1,0 +1,24 @@
+name: websocket-echo
+description: WebSocket upgrade + two echo frames through drps and frps
+upstream:
+  kind: ws-echo
+frpc:
+  proxies:
+    - name: ws
+      type: http
+      localIP: ws-echo
+      localPort: 9090
+      customDomains: ["ws.local"]
+request:
+  method: GET
+  host: ws.local
+  path: /ws
+  streaming: websocket
+  ws_frames:
+    - "hello"
+    - "world"
+expect:
+  mode: websocket
+  status: 101
+  ws_frame_count: 2
+expected_divergence: []
