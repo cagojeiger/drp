@@ -1,0 +1,6 @@
+bindPort = 17000
+vhostHTTPPort = 18080
+
+[auth]
+method = "token"
+token = "compat-token"

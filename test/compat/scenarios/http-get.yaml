@@ -1,0 +1,20 @@
+name: http-get
+description: Static nginx GET through drps and frps
+upstream:
+  kind: nginx
+frpc:
+  proxies:
+    - name: web
+      type: http
+      localIP: backend
+      localPort: 80
+      customDomains: ["test.local"]
+request:
+  method: GET
+  host: test.local
+  path: /
+expect:
+  mode: http
+  status: 200
+  min_body_bytes: 100
+expected_divergence: []
