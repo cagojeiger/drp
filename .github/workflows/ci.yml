@@ -9,6 +9,10 @@ on:
       - "go.mod"
       - "go.sum"
       - "Dockerfile"
+      - "test/Dockerfile.frpc"
+      - "test/Dockerfile.frps"
+      - "test/compat/**"
+      - "test/ws-echo/**"
       - ".github/workflows/ci.yml"
   push:
     branches: [main]
@@ -17,6 +21,10 @@ on:
       - "go.mod"
       - "go.sum"
       - "Dockerfile"
+      - "test/Dockerfile.frpc"
+      - "test/Dockerfile.frps"
+      - "test/compat/**"
+      - "test/ws-echo/**"
       - ".github/workflows/ci.yml"
 
 concurrency:
@@ -75,3 +83,8 @@ jobs:
 
       - name: E2E Tests
         run: go test ./test/ -v -timeout 300s
+
+      - name: Compat Tests (drps vs frps)
+        env:
+          COMPAT_SERIAL: "1"
+        run: go test ./test/compat/... -v -timeout 900s
