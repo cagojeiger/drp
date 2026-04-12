@@ -137,18 +137,19 @@ func (h *Handler) handleLogin(conn net.Conn, login *msg.Login) {
 	ctx, cancel := context.WithCancel(context.Background())
 	reqCh := make(chan struct{}, controlReqChSize)
 	sendCh := make(chan msg.Message, controlSendChSize)
-	go sendLoop(encWriter, reqCh, sendCh, h.ReqStats)
+	done := ctx.Done()
+	go sendLoop(encWriter, reqCh, sendCh, done, h.ReqStats)
 
 	h.bootstrapReqWorkConn(login.PoolCount, reqCh)
 
 	// A reconnect from the same runID cancels the old session before the
 	// new one starts serving.
-	h.controls.Register(runID, cancel, reqCh, sendCh, ctx.Done())
+	h.controls.Register(runID, cancel, reqCh, sendCh, done)
 
 	registeredProxies := make(map[string]struct{})
 	h.controlLoop(ctx, conn, encReader, sendCh, runID, registeredProxies)
 
-	h.cleanupControlSession(cancel, reqCh, sendCh, runID, registeredProxies)
+	h.cleanupControlSession(cancel, runID, registeredProxies)
 }
 
 // bootstrapReqWorkConn pre-fills the control write queue with N refill
@@ -166,12 +167,16 @@ func (h *Handler) bootstrapReqWorkConn(poolCount int, reqCh chan<- struct{}) {
 }
 
 // cleanupControlSession tears down one session's resources: cancel the
-// context, close the channels, deregister from the manager, drop the
-// router entries, and notify the owner via OnControlClose.
-func (h *Handler) cleanupControlSession(cancel context.CancelFunc, reqCh chan struct{}, sendCh chan msg.Message, runID string, registeredProxies map[string]struct{}) {
+// context (which signals sendLoop to exit and unblocks any pending
+// SendReqWorkConn callers via their done case), deregister from the
+// manager, drop the router entries, and notify the owner via
+// OnControlClose.
+//
+// Neither reqCh nor sendCh is closed. Shutdown flows exclusively through
+// ctx.Done(), which removes the "send on closed channel" race that the
+// previous close-based cleanup had to guard against with recover().
+func (h *Handler) cleanupControlSession(cancel context.CancelFunc, runID string, registeredProxies map[string]struct{}) {
 	cancel()
-	close(reqCh)
-	close(sendCh)
 	h.controls.Remove(runID)
 	if h.Router != nil {
 		for name := range registeredProxies {

@@ -45,7 +45,10 @@ const (
 //   - Only run() may touch bw; no external goroutine writes directly.
 //   - Refill signals are merged into batched ReqWorkConn{Count: N} messages.
 //   - Response messages flush immediately on both sides so latency stays low.
-//   - The loop exits once both channels are drained AND closed.
+//   - The loop exits when done fires (ctx cancellation) OR when the
+//     underlying writer errors. Neither reqCh nor sendCh is ever closed —
+//     shutdown is signalled exclusively via done, which lets external
+//     senders race-freely fall through to their done-case.
 //
 // The type exists to replace a 150-line nest of closures that all shared
 // the same bufio.Writer + flush timer + pending-flush flag. As fields on a
@@ -56,18 +59,21 @@ type controlWriter struct {
 	pendingFlush bool
 	reqCh        <-chan struct{}
 	sendCh       <-chan msg.Message
+	done         <-chan struct{}
 	stats        *ReqWorkConnStats
 }
 
 // sendLoop wires up a controlWriter for w and runs it to completion.
 // Kept as a free function so callers (and tests) can use the same entry
-// point as before.
-func sendLoop(w io.Writer, reqCh <-chan struct{}, sendCh <-chan msg.Message, stats *ReqWorkConnStats) {
+// point as before. The loop terminates when done is closed or when any
+// write on w returns an error.
+func sendLoop(w io.Writer, reqCh <-chan struct{}, sendCh <-chan msg.Message, done <-chan struct{}, stats *ReqWorkConnStats) {
 	cw := &controlWriter{
 		bw:         bufio.NewWriterSize(w, controlWriteBufferBytes),
 		flushTimer: time.NewTimer(time.Hour),
 		reqCh:      reqCh,
 		sendCh:     sendCh,
+		done:       done,
 		stats:      stats,
 	}
 	stopTimer(cw.flushTimer)
@@ -76,48 +82,44 @@ func sendLoop(w io.Writer, reqCh <-chan struct{}, sendCh <-chan msg.Message, sta
 
 // run is the main event loop. It prioritizes refill signals (so the
 // work-conn pool stays warm) and falls back to a multi-way select that
-// blocks on either channel or the flush timer.
+// blocks on either channel, the flush timer, or the shutdown signal.
 func (cw *controlWriter) run() {
 	defer cw.bw.Flush()
 
-	for cw.reqCh != nil || cw.sendCh != nil {
-		// Fast path: drain refill signals before touching sendCh or the
-		// flush timer. Keeps the pool responsive under burst load.
-		if cw.reqCh != nil {
-			select {
-			case _, ok := <-cw.reqCh:
-				if !ok {
-					cw.reqCh = nil
-					continue
-				}
-				if err := cw.writeReq(1); err != nil {
-					return
-				}
-				if err := cw.writeReqBatch(); err != nil {
-					return
-				}
-				continue
-			default:
-			}
+	for {
+		// Fast-exit check: if the session is already cancelled, bail
+		// before doing any more work.
+		select {
+		case <-cw.done:
+			return
+		default:
 		}
 
+		// Fast path: drain refill signals before touching sendCh or the
+		// flush timer. Keeps the pool responsive under burst load.
 		select {
-		case _, ok := <-cw.reqCh:
-			if !ok {
-				cw.reqCh = nil
-				continue
-			}
+		case <-cw.reqCh:
 			if err := cw.writeReq(1); err != nil {
 				return
 			}
 			if err := cw.writeReqBatch(); err != nil {
 				return
 			}
-		case m, ok := <-cw.sendCh:
-			if !ok {
-				cw.sendCh = nil
-				continue
+			continue
+		default:
+		}
+
+		select {
+		case <-cw.done:
+			return
+		case <-cw.reqCh:
+			if err := cw.writeReq(1); err != nil {
+				return
 			}
+			if err := cw.writeReqBatch(); err != nil {
+				return
+			}
+		case m := <-cw.sendCh:
 			// Control responses flush on both sides to minimize the
 			// observed round-trip latency.
 			if err := cw.flush(); err != nil {
@@ -176,9 +178,6 @@ func (cw *controlWriter) writeReq(count int) error {
 // queue is deep enough to trigger the mid/high bucket it forces a flush so
 // the bytes do not sit in the buffer.
 func (cw *controlWriter) writeReqBatch() error {
-	if cw.reqCh == nil {
-		return nil
-	}
 	limit := cw.batchLimit()
 	if limit <= 0 {
 		limit = 1
@@ -186,11 +185,7 @@ func (cw *controlWriter) writeReqBatch() error {
 	batch := 0
 	for batch < limit {
 		select {
-		case _, ok := <-cw.reqCh:
-			if !ok {
-				cw.reqCh = nil
-				return nil
-			}
+		case <-cw.reqCh:
 			batch++
 		default:
 			if batch == 0 {
