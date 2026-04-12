@@ -31,10 +31,10 @@ func (ce *controlEntry) Send(m msg.Message) {
 // guarantee while the control session is alive. Returns false when the
 // session has already been torn down.
 //
-// The recover() guards against the narrow race where sendCh is closed
-// between our <-ce.done check and the send; see cleanupControlSession.
+// This is race-free without recover() because cleanupControlSession no
+// longer closes reqCh — shutdown flows exclusively through ctx.Done()
+// (ce.done here), and sending on an open buffered channel never panics.
 func (ce *controlEntry) SendReqWorkConn() bool {
-	defer func() { _ = recover() }()
 	select {
 	case ce.reqCh <- struct{}{}:
 		return true
