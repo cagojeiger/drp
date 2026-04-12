@@ -1,3 +1,7 @@
+// Package pool holds the per-session work-connection pool that drps uses
+// to serve HTTP requests. Each frpc session gets its own Pool; the Pool
+// buffers up to Capacity idle work-conns and asks frpc for more via the
+// supplied requestFn whenever Get is about to block.
 package pool
 
 import (
@@ -8,44 +12,65 @@ import (
 	"time"
 )
 
-// Pool manages a pool of work connections.
-// RequestConn is called when more connections are needed (sends ReqWorkConn to frpc).
-type Pool struct {
-	conns          chan net.Conn
-	requestFn      func()
-	refilling      atomic.Bool
-	pendingRefills atomic.Int64
-	getHit         atomic.Int64
-	getMiss        atomic.Int64
-	getTimeout     atomic.Int64
-	refillDemand   atomic.Int64
-	refillSent     atomic.Int64
-	closed         bool
-	closedOnce     sync.Once
-	mu             sync.Mutex
-}
-
 const (
-	// miss 시 한 번에 추가 요청할 최소 개수.
+	// defaultCapacity is the work-conn buffer size when callers do not
+	// specify one. 64 matches the pre-refactor variadic default.
+	defaultCapacity = 64
+
+	// minMissRefillBurst is the floor for the extra refill request that
+	// Get issues when the pool is empty. Always ≥ 2 so at least one spare
+	// is already on its way by the time the current request returns.
 	minMissRefillBurst = 2
-	// miss 시 과도한 폭주를 막기 위한 상한.
+
+	// maxMissRefillBurst caps the per-miss refill burst so a sudden surge
+	// of misses cannot flood frpc with refill requests.
 	maxMissRefillBurst = 8
 )
 
-// New creates a pool with the given capacity.
-// requestFn is called to request a new work connection from frpc.
+// Pool manages a bounded channel of idle work-connections. Every Get on an
+// empty pool triggers an asynchronous refill via requestFn; the refill
+// worker coalesces concurrent demand into a single goroutine.
+type Pool struct {
+	// --- connection queue ---
+	conns chan net.Conn
+
+	// --- refill machinery ---
+	requestFn      func()
+	refilling      atomic.Bool
+	pendingRefills atomic.Int64
+
+	// --- statistics (lock-free, see Stats()) ---
+	getHit       atomic.Int64
+	getMiss      atomic.Int64
+	getTimeout   atomic.Int64
+	refillDemand atomic.Int64
+	refillSent   atomic.Int64
+
+	// --- teardown ---
+	mu         sync.Mutex
+	closed     bool
+	closedOnce sync.Once
+}
+
+// New creates a Pool wired to requestFn, which is invoked each time the
+// pool wants frpc to hand it another work-conn. The optional capacity
+// argument sets the idle-conn buffer size; it is retained as a variadic
+// parameter because the majority of tests construct pools without caring
+// about capacity, and the production path (cmd/drps/main.go via
+// Registry.GetOrCreate) always supplies one explicitly.
 func New(requestFn func(), capacity ...int) *Pool {
-	cap := 64
+	c := defaultCapacity
 	if len(capacity) > 0 && capacity[0] > 0 {
-		cap = capacity[0]
+		c = capacity[0]
 	}
 	return &Pool{
-		conns:     make(chan net.Conn, cap),
+		conns:     make(chan net.Conn, c),
 		requestFn: requestFn,
 	}
 }
 
-// Put adds a work connection to the pool.
+// Put hands a freshly delivered work-conn to the pool. If the pool is at
+// capacity or already closed, conn is closed instead of being enqueued.
 func (p *Pool) Put(conn net.Conn) {
 	p.mu.Lock()
 	if p.closed {
@@ -58,14 +83,15 @@ func (p *Pool) Put(conn net.Conn) {
 	select {
 	case p.conns <- conn:
 	default:
-		// 풀 가득 참 → 버림
+		// Pool full → drop the arriving conn to keep the buffer size
+		// honest.
 		conn.Close()
 	}
 }
 
-// Get retrieves a work connection from the pool.
-// If empty, requests a new one and waits up to timeout.
-// After successful Get, triggers eager refill without dropping refill demand.
+// Get retrieves an idle work-conn. When the pool is empty, Get issues a
+// refill burst and waits up to timeout for a conn to arrive. Every
+// successful Get also triggers a one-slot refill so the buffer stays warm.
 func (p *Pool) Get(timeout time.Duration) (net.Conn, error) {
 	p.mu.Lock()
 	if p.closed {
@@ -74,7 +100,7 @@ func (p *Pool) Get(timeout time.Duration) (net.Conn, error) {
 	}
 	p.mu.Unlock()
 
-	// 풀에서 즉시 시도
+	// Fast path: an idle conn is ready.
 	select {
 	case conn, ok := <-p.conns:
 		if !ok {
@@ -86,7 +112,7 @@ func (p *Pool) Get(timeout time.Duration) (net.Conn, error) {
 	default:
 	}
 
-	// 비어있음 → 요청 후 대기
+	// Empty → account the miss and ask for a burst before blocking.
 	p.getMiss.Add(1)
 	p.requestAsyncRefill(p.missRefillBurst())
 
@@ -106,12 +132,16 @@ func (p *Pool) Get(timeout time.Duration) (net.Conn, error) {
 	}
 }
 
+// missRefillBurst picks the size of the refill burst issued on a Get miss.
+// It aims for one quarter of the pool capacity, clamped to
+// [minMissRefillBurst, maxMissRefillBurst]. Returning int64 matches the
+// requestAsyncRefill signature so the two never need a cast at the call
+// site.
 func (p *Pool) missRefillBurst() int64 {
 	c := cap(p.conns)
 	if c <= 0 {
 		return minMissRefillBurst
 	}
-	// 용량의 1/4를 기본 버스트로 잡고 상/하한을 둔다.
 	burst := c / 4
 	if burst < minMissRefillBurst {
 		burst = minMissRefillBurst
@@ -122,7 +152,8 @@ func (p *Pool) missRefillBurst() int64 {
 	return int64(burst)
 }
 
-// requestAsyncRefill accumulates refill demand and drains it with one worker.
+// requestAsyncRefill accumulates refill demand and spawns (or re-uses) a
+// single worker goroutine that drains it by calling requestFn.
 func (p *Pool) requestAsyncRefill(n int64) {
 	if n <= 0 {
 		return
@@ -132,6 +163,10 @@ func (p *Pool) requestAsyncRefill(n int64) {
 	p.startRefillWorker()
 }
 
+// startRefillWorker starts the drain goroutine if one is not already
+// running. The CAS guard ensures only one worker exists at a time; the
+// worker loops until pendingRefills drains, handling the small race where
+// new demand arrives between Swap(0) and the worker going idle.
 func (p *Pool) startRefillWorker() {
 	if !p.refilling.CompareAndSwap(false, true) {
 		return
@@ -141,7 +176,8 @@ func (p *Pool) startRefillWorker() {
 			n := p.pendingRefills.Swap(0)
 			if n == 0 {
 				p.refilling.Store(false)
-				// Handle race: new demand can arrive between Swap(0) and Store(false).
+				// Race: new demand can arrive between Swap(0) and
+				// Store(false). Re-claim the worker if so.
 				if p.pendingRefills.Load() == 0 || !p.refilling.CompareAndSwap(false, true) {
 					return
 				}
@@ -156,6 +192,7 @@ func (p *Pool) startRefillWorker() {
 	}()
 }
 
+// Stats is a JSON-serializable snapshot of the pool counters.
 type Stats struct {
 	GetHit       int64 `json:"get_hit"`
 	GetMiss      int64 `json:"get_miss"`
@@ -164,6 +201,7 @@ type Stats struct {
 	RefillSent   int64 `json:"refill_sent"`
 }
 
+// Stats returns a point-in-time read of every counter.
 func (p *Pool) Stats() Stats {
 	return Stats{
 		GetHit:       p.getHit.Load(),
@@ -174,7 +212,8 @@ func (p *Pool) Stats() Stats {
 	}
 }
 
-// Close closes the pool and all remaining connections.
+// Close marks the pool closed and drains any remaining buffered conns.
+// Safe to call multiple times.
 func (p *Pool) Close() {
 	p.closedOnce.Do(func() {
 		p.mu.Lock()
