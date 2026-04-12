@@ -141,7 +141,7 @@ stateDiagram-v2
     ControlLoop --> HandleMsg: receive
     HandleMsg --> ControlLoop: Ping/Pong/NewProxy/CloseProxy
     ControlLoop --> Cleanup: disconnect / ctx cancel
-    Cleanup --> [*]: cancel()만 호출,<br/>채널 close 안 함
+    Cleanup --> [*]: cancel + controls.Remove +<br/>Router.Remove + OnControlClose<br/>(채널 close 없음)
     WorkConn --> [*]: OnWorkConn callback
 ```
 
