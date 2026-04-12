@@ -92,23 +92,23 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    main[cmd/drps/main.go<br/>엔트리포인트]
+    main[cmd/drps/main.go<br/>엔트리포인트<br/><br/>buildServerStack<br/>buildHTTPMux<br/>runFrpcAccept]
 
     subgraph cfg["설정"]
         config[internal/config]
     end
 
     subgraph proto["프로토콜 계층"]
-        server[internal/server]
+        server[internal/server<br/><br/>handle.go<br/>control_writer.go<br/>control_manager.go<br/>proxy_register.go<br/>stats.go]
         msg[internal/msg]
         auth[internal/auth]
         crypto[internal/crypto]
     end
 
     subgraph svc["서비스 계층"]
-        proxy[internal/proxy]
+        proxy[internal/proxy<br/><br/>newReverseProxy<br/>newTransport<br/>routeDialKey<br/>routeFromCtx]
         router[internal/router]
-        pool[internal/pool]
+        pool[internal/pool<br/><br/>connection queue<br/>refill machinery<br/>statistics<br/>teardown]
         wrap[internal/wrap]
     end
 

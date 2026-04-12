@@ -147,4 +147,16 @@ flowchart TB
     exit --> rm3[controlManager.Remove]
 ```
 
-구현: `internal/server` — Handler, controlManager, controlLoop
+구현: `internal/server/handle.go` 는 refactor rounds 1-3 에서 5개 파일로 분할되었다. 기존 `metrics.go`, `util.go` 는 그대로 유지된다.
+
+| 파일 | 담당 |
+|---|---|
+| `handle.go` | `Handler`, `HandleConnection`, `handleLogin`, `controlLoop`, `bootstrapReqWorkConn`, `cleanupControlSession` |
+| `control_writer.go` | `controlWriter` + `sendLoop` wrapper, adaptive batching, flush timer |
+| `control_manager.go` | `controlManager`, `controlEntry` (per-session state, RLock 핫패스) |
+| `proxy_register.go` | `handleNewProxy` (NewProxy → router 등록 + rollback) |
+| `stats.go` | `ReqWorkConnStats`, `ReqWorkConnSnapshot` |
+| `metrics.go` | `MetricsHandler` — `/__drps/metrics` JSON 엔드포인트 (preexisting) |
+| `util.go` | `generateRunID` — 랜덤 8-byte hex (preexisting) |
+
+세션 teardown 은 `cancel()` 단일 시그널로만 전파된다 — `reqCh`/`sendCh` 는 **never closed**. `cleanupControlSession` 은 `cancel()` → `controls.Remove` → `Router.Remove(registeredProxies)` → `OnControlClose(runID)` 콜백 순으로 정리하지만, 채널 close 는 없다.

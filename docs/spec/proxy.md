@@ -35,7 +35,7 @@ flowchart TB
 | Pool 조회 | proxyName → RangeByProxy O(N) → runID → Get | **cfg.RunID → Get O(1)** |
 | AES 키 | 매 요청 DeriveKey (PBKDF2) | **시작 시 1회 계산, 캐시 전달** |
 | 응답 바디 버퍼 | 매 요청 임시 버퍼 | **ReverseProxy BufferPool 재사용** |
-| 라우트 격리 | 주소 충돌 가능 | **synthetic URL.Host keying으로 라우트별 idle conn 격리** |
+| 라우트 격리 | 주소 충돌 가능 | **`routeDialKey(cfg)` = `Domain.Location.ProxyName.drps` 로 라우트별 idle conn 격리** |
 | HTTP/2 cleartext | 미지원 | **h2c.NewHandler 기반 지원** |
 | WriteMsg | 3 syscall | **1 syscall** |
 
