@@ -226,28 +226,52 @@ flowchart TB
 
 ## 8. 서버 시작 시 초기화
 
+`main()` 은 얇은 orchestrator 이고, setup 은 네 개의 named helper 로 분해되어있다: `buildServerStack`, `buildHTTPMux`, `runFrpcAccept`, `handleFrpcConnection` (+ `openYamuxSession`).
+
 ```mermaid
 sequenceDiagram
-    participant M as main.go
-    participant C as config
-    participant R as router
-    participant Reg as pool.Registry
-    participant Cr as crypto
-    participant S as server.Handler
-    participant P as proxy.Handler
+    participant M as main()
+    participant BSS as buildServerStack
+    participant BHM as buildHTTPMux
+    participant RFA as runFrpcAccept
+    participant HTTP as srv.ListenAndServe
 
-    M->>C: Load() → flags + env
-    M->>R: New()
-    M->>Reg: NewRegistry()
-    M->>Cr: DeriveKey(token) → aesKey (1회)
-    M->>S: NewHandler(token, router, onWorkConn, onClose)
-    M->>P: NewHandler(router, registry.Get, aesKey)
+    M->>M: config.Load()
+    M->>BSS: buildServerStack(cfg, debug)
+    BSS->>BSS: router.New()
+    BSS->>BSS: pool.NewRegistry()
+    BSS->>BSS: crypto.DeriveKey(token) 1회
+    BSS->>BSS: server.Handler{Router, OnWorkConn, OnControlClose}
+    BSS->>BSS: proxy.NewHandler(router, registry.Get, aesKey)
+    BSS-->>M: *serverStack
 
-    par
-        M->>M: goroutine: TCP Listen(:17000)
-        Note right of M: per conn: yamux server + handleTCP
-    and
-        M->>M: HTTP Listen(:18080)
-        Note right of M: proxy + /__drps/metrics + /debug/pprof
+    M->>BHM: buildHTTPMux(stack, cfg)
+    BHM->>BHM: mux.HandleFunc /__drps/metrics
+    opt DRPS_PPROF=1
+        BHM->>BHM: registerPprofEndpoints(mux)
     end
+    BHM->>BHM: mux.Handle("/", stack.proxyHandler)
+    BHM-->>M: *http.ServeMux
+
+    M->>M: net.Listen("tcp", cfg.FrpcAddr)
+    M->>RFA: go runFrpcAccept(ln, handler, cfg)
+    M->>HTTP: srv.ListenAndServe() blocks
 ```
+
+### frpc accept 루프
+
+```mermaid
+flowchart LR
+    RFA[runFrpcAccept<br/>for ln.Accept]
+    HFC[handleFrpcConnection<br/>per-conn]
+    OYS[openYamuxSession<br/>yamux tuning]
+    Loop[for session.AcceptStream]
+    HC[h.HandleConnection<br/>per-stream]
+
+    RFA -->|go| HFC
+    HFC --> OYS
+    OYS --> Loop
+    Loop -->|go| HC
+```
+
+각 단계는 별도 함수로 분리되어 main() 이 "config → stack → mux → listener → go accept → serve" 의 **의도 레벨** 로만 읽힌다. yamux tuning (MaxStreamWindowSize 등) 은 `openYamuxSession` 안에만 존재.

@@ -33,7 +33,27 @@ classDiagram
 
 ## 2. server (Protocol Layer)
 
-frpc와의 제어 채널을 관리. 단일 writer 원칙(sendLoop).
+frpc와의 제어 채널을 관리. **단일 writer 원칙** — 제어 채널에 바이트를 쓰는 goroutine 은 `controlWriter.run()` 하나뿐.
+
+### 파일 레이아웃
+
+`internal/server/` 는 책임별로 5개 파일로 분리됨:
+
+```mermaid
+flowchart LR
+    handle[handle.go<br/>Handler + HandleConnection +<br/>handleLogin + controlLoop]
+    cmgr[control_manager.go<br/>controlManager + controlEntry]
+    cwriter[control_writer.go<br/>controlWriter + sendLoop]
+    preg[proxy_register.go<br/>handleNewProxy]
+    stats[stats.go<br/>ReqWorkConnStats]
+
+    handle --> cmgr
+    handle --> cwriter
+    handle --> preg
+    handle --> stats
+```
+
+### 주요 타입
 
 ```mermaid
 classDiagram
@@ -55,7 +75,7 @@ classDiagram
         -entries map~string~*controlEntry
         +Register()
         +Remove()
-        +GetEntry()
+        +GetEntry() RLock hot path
     }
 
     class controlEntry {
@@ -63,8 +83,24 @@ classDiagram
         +reqCh chan struct
         +sendCh chan Message
         +done chan struct
-        +Send(m Message)
-        +SendReqWorkConn() bool
+        +Send(m Message) best-effort
+        +SendReqWorkConn() bool guaranteed
+    }
+
+    class controlWriter {
+        -bw bufio.Writer
+        -flushTimer Timer
+        -pendingFlush bool
+        -reqCh chan struct
+        -sendCh chan Message
+        -done chan struct
+        -stats *ReqWorkConnStats
+        +run()
+        +flush() error
+        +writeReq(n int) error
+        +writeReqBatch() error
+        +batchLimit() int
+        +flushDelay() Duration
     }
 
     class ReqWorkConnStats {
@@ -79,6 +115,7 @@ classDiagram
     Handler --> controlManager
     controlManager --> controlEntry
     Handler --> ReqWorkConnStats
+    Handler ..> controlWriter : spawns sendLoop
 ```
 
 ### 제어 흐름
@@ -97,23 +134,68 @@ stateDiagram-v2
     ControlLoop --> HandleMsg: receive
     HandleMsg --> ControlLoop: Ping/Pong/NewProxy/CloseProxy
     ControlLoop --> Cleanup: disconnect / ctx cancel
-    Cleanup --> [*]
+    Cleanup --> [*]: cancel()만 호출,<br/>채널 close 안 함
     WorkConn --> [*]: OnWorkConn callback
 ```
 
-### sendLoop
+### controlWriter / sendLoop
 
-제어 채널의 유일한 writer. `reqCh`(ReqWorkConn 요청)와 `sendCh`(일반 메시지)를 배칭해서 flush.
+제어 채널의 유일한 writer. `sendLoop(w, reqCh, sendCh, done, stats)` 는 얇은 래퍼이고, 실제 로직은 `controlWriter.run()` 에 있음.
 
-- `reqCh` 깊이에 따라 adaptive flush (50μs ~ 400μs)
-- `sendCh`는 즉시 flush
+- `reqCh`(ReqWorkConn 요청): backlog 깊이별로 adaptive batch + flush
+  - `≥ 512`: batch 128, flush 50μs
+  - `≥ 128`: batch 64,  flush 200μs
+  - `else` : batch 16,  flush 400μs
+- `sendCh`(일반 메시지): 양쪽에서 즉시 flush (latency 최소화)
 - 통계: requested / enqueued / dropped / sent / inflight
+
+### shutdown 시그널
+
+**단일 시그널 원칙**: 제어 세션 종료는 `ctx.Done()` (= `controlEntry.done`) 하나로만 전파된다.
+
+- `cleanupControlSession` 은 `cancel()` 만 호출하고 `reqCh`/`sendCh` 를 **close 하지 않는다**.
+- `controlWriter.run()` 은 루프 매 iteration 시작에 `<-done` 빠른-탈출 + select 내부에도 `<-done` case.
+- `SendReqWorkConn()` 은 `reqCh <-` 와 `<-done` 둘 중 먼저 오는 쪽을 취한다 (send-on-closed-channel 레이스 없음, `recover()` 불필요).
 
 ---
 
 ## 3. proxy (Service Layer)
 
-HTTP 요청을 워크 커넥션으로 전달.
+HTTP 요청을 워크 커넥션으로 전달. `NewHandler` 는 얇은 orchestrator 이고, 실제 wiring 은 named builder/hook 으로 분해되어있다.
+
+### 구성
+
+```mermaid
+flowchart TB
+    NH[NewHandler]
+    NRP[h.newReverseProxy]
+    NT[h.newTransport]
+    BP[newBufferPool]
+    H2C[h2c.NewHandler]
+
+    RW[rewriteRequest<br/>free fn]
+    MR[applyResponseHeaders<br/>free fn]
+    EH[proxyErrorHandler<br/>free fn]
+    DC[DialContext closure<br/>→ h.dialWorkConn]
+
+    RDK[routeDialKey cfg<br/>= D.L.P.drps]
+    RFC[routeFromCtx ctx<br/>→ *RouteConfig]
+
+    NH --> NRP
+    NH --> H2C
+    NRP --> RW
+    NRP --> MR
+    NRP --> EH
+    NRP --> NT
+    NRP --> BP
+    NT --> DC
+    RW -.-> RFC
+    RW -.-> RDK
+    MR -.-> RFC
+    DC -.-> RFC
+```
+
+### 주요 타입
 
 ```mermaid
 classDiagram
@@ -125,34 +207,43 @@ classDiagram
         +WorkConnTimeout Duration
         +ResponseTimeout Duration
         +ServeHTTP(w, r)
+        +newReverseProxy() *ReverseProxy
+        +newTransport() *http.Transport
+        +dialWorkConn(ctx) net.Conn
     }
 
-    class reverseProxy {
-        +h2c.NewHandler(http2.Server)
-        +Rewrite()
-        +ModifyResponse()
-        +DialContext()
-        +ErrorHandler()
+    class bufferPool {
+        -pool sync.Pool
+        +Get() []byte
+        +Put(b []byte)
     }
 
-    Handler --> reverseProxy
+    Handler --> bufferPool : newBufferPool 32KiB
     Handler --> "router.Router" : Lookup
-    Handler --> "pool.Registry" : poolLookup(runID)
-    Handler --> "wrap" : Wrap(aesKey)
+    Handler --> "pool.Registry" : poolLookup runID
+    Handler --> "wrap" : Wrap aesKey
 ```
 
 ### 요청 처리
 
 1. `Router.Lookup(Host, Path)` → `RouteConfig` (RunID 포함)
 2. Basic Auth 검증 (HTTPUser 설정 시)
-3. `poolLookup(cfg.RunID)` → `*Pool` 직접 조회 (이중 조회 제거)
-4. `Pool.Get(timeout)` → 워크 커넥션
-5. `wrap.Wrap(conn, aesKey, proxyName, enc, comp)` → StartWorkConn + AES/snappy
-6. ReverseProxy `Rewrite` 단계에서 HostHeaderRewrite + custom headers 주입
-7. ReverseProxy `DialContext`가 wrapped conn을 반환해 백엔드와 바이트 교환
-8. Transport keying: `URL.Host = Domain.Location.ProxyName.drps` 로 라우트별 idle conn 분리
-9. `h2c.NewHandler`로 HTTP/2 cleartext(h2c) 지원
-10. `ModifyResponse`에서 response headers 주입 (WebSocket 101 포함 업그레이드는 ReverseProxy가 처리)
+3. `context.WithValue(ctx, routeCtxKey{}, cfg)` — 이후 모든 hook 은 `routeFromCtx(ctx)` 로 cfg 재조회 (router 재실행 안 함)
+4. `rewriteRequest` hook:
+   - `URL.Host = routeDialKey(cfg)` — idle-conn 풀이 라우트 단위로 분리되도록 **합성 호스트** 사용 (`Domain.Location.ProxyName.drps`). 포맷이 `.drps` 로 끝나므로 실 DNS 이름과 충돌 불가.
+   - HostHeaderRewrite + custom headers 주입
+5. `Transport.DialContext` → `h.dialWorkConn(ctx)`:
+   - `poolLookup(cfg.RunID)` → `*Pool`
+   - `Pool.Get(timeout)` → 워크 커넥션
+   - `wrap.Wrap(conn, aesKey, proxyName, enc, comp)` → StartWorkConn + AES/snappy
+   - `ResponseTimeout` 설정 시 `wrapped.SetDeadline` 적용
+6. `h2c.NewHandler` 래핑으로 HTTP/2 cleartext(h2c) 업그레이드 지원
+7. `applyResponseHeaders` hook 에서 response headers 주입 (WebSocket 101 포함 업그레이드는 ReverseProxy 가 처리)
+8. 에러는 `proxyErrorHandler` 로 수렴: `net.Error.Timeout()` → 504, 그 외 → 502
+
+### 왜 routeDialKey 인가
+
+`http.Transport` 의 idle-connection pool 은 **URL.Host 단위** 로 분리된다. 모든 요청이 동일한 실 호스트(예: `backend`)를 가진다면 `MaxIdleConnsPerHost=5` 제한이 전체 라우트에 공유되어 한 upstream 이 느려지면 다른 라우트까지 blocking 된다. `routeDialKey(cfg)` 로 합성 키를 쓰면 Transport 내부 pool 이 **라우트별로 격리**된다 — 실제 dial 은 `DialContext` 가 하므로 호스트 이름은 임의여도 무관.
 
 ---
 
@@ -204,18 +295,23 @@ flowchart LR
 
 ## 5. pool
 
-워크 커넥션 풀. 채널 기반. 설정 가능한 capacity.
+워크 커넥션 풀. 채널 기반. 필드는 역할별로 4 그룹으로 정렬됨 (connection queue / refill machinery / statistics / teardown).
 
 ```mermaid
 classDiagram
     class Pool {
-        -ch chan net.Conn
+        -conns chan net.Conn
         -requestFn func
-        -capacity int
-        -refillMu sync.Mutex
-        -pending atomic.Int64
-        -refillActive atomic.Bool
-        -stats atomic counters
+        -refilling atomic.Bool
+        -pendingRefills atomic.Int64
+        -getHit atomic.Int64
+        -getMiss atomic.Int64
+        -getTimeout atomic.Int64
+        -refillDemand atomic.Int64
+        -refillSent atomic.Int64
+        -mu sync.Mutex
+        -closed bool
+        -closedOnce sync.Once
         +Get(timeout) conn
         +Put(conn)
         +Stats() Stats
@@ -225,7 +321,7 @@ classDiagram
     class Registry {
         -mu sync.RWMutex
         -pools map~runID~*Pool
-        +GetOrCreate(runID, fn) *Pool
+        +GetOrCreate(runID, fn, cap) *Pool
         +Get(runID) *Pool
         +AggregateStats() AggregateStats
     }
@@ -241,6 +337,8 @@ classDiagram
     Registry --> Pool
     Pool --> Stats
 ```
+
+`defaultCapacity = 64`. `New(requestFn, capacity...)` 의 variadic 은 테스트 편의용으로 유지되며, 프로덕션 경로(`cmd/drps/main.go` → `Registry.GetOrCreate`) 는 항상 명시적 capacity 를 전달한다.
 
 ### Get/Put 상태
 

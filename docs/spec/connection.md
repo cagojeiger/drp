@@ -147,4 +147,14 @@ flowchart TB
     exit --> rm3[controlManager.Remove]
 ```
 
-구현: `internal/server` — Handler, controlManager, controlLoop
+구현: `internal/server/` 는 책임별로 5개 파일로 분리됨.
+
+| 파일 | 담당 |
+|---|---|
+| `handle.go` | `Handler`, `HandleConnection`, `handleLogin`, `controlLoop`, bootstrap/cleanup |
+| `control_writer.go` | `controlWriter` + `sendLoop` wrapper, adaptive batching, flush timer |
+| `control_manager.go` | `controlManager`, `controlEntry` (per-session state, RLock 핫패스) |
+| `proxy_register.go` | `handleNewProxy` (NewProxy → router 등록 + rollback) |
+| `stats.go` | `ReqWorkConnStats`, `ReqWorkConnSnapshot` |
+
+세션 teardown 은 `cancel()` 단일 시그널로만 전파된다 — `reqCh`/`sendCh` 는 never closed.
