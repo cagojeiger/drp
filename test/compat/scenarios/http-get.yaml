@@ -1,13 +1,13 @@
 name: http-get
-description: Static nginx GET through drps and frps
+description: Static HTTP echo GET through drps and frps
 upstream:
-  kind: nginx
+  kind: http-echo
 frpc:
   proxies:
     - name: web
       type: http
-      localIP: backend
-      localPort: 80
+      localIP: "127.0.0.1"
+      localPort: 0
       customDomains: ["test.local"]
 request:
   method: GET

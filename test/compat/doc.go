@@ -1,10 +1,13 @@
 // Package compat contains the drps ↔ frps functional-equivalence test suite.
 //
-// This package is separate from the existing E2E suite at test/integration_test.go
-// (package test) which MUST remain byte-identical. The compat suite adds scenario-
-// driven equivalence verification on top of the same testcontainers-go + DinD
-// infrastructure.
+// Each scenario in scenarios/*.yaml is run against both drps and frps
+// (process-based, no Docker required) and their responses are compared for
+// semantic equivalence: status code, body hash, headers, WebSocket frames.
 //
-// See .omc/plans/compat-tests-plan.md and .omc/specs/deep-interview-compat-tests.md
-// for the design rationale and consensus-approved implementation plan.
+// The test infrastructure lives in framework/ and uses patterns adopted from
+// frp's own E2E suite: exec.Command process management, mod-partitioned
+// port allocation, in-process mock backends, and stdout readiness polling.
+//
+// Adding a scenario: drop a YAML file in scenarios/ and (if needed) add a
+// backend kind in framework/backend.go. No runner code changes required.
 package compat

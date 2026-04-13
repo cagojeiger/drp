@@ -9,10 +9,8 @@ on:
       - "go.mod"
       - "go.sum"
       - "Dockerfile"
-      - "test/Dockerfile.frpc"
-      - "test/Dockerfile.frps"
       - "test/compat/**"
-      - "test/ws-echo/**"
+      - "test/regression/**"
       - ".github/workflows/ci.yml"
   push:
     branches: [main]
@@ -21,10 +19,8 @@ on:
       - "go.mod"
       - "go.sum"
       - "Dockerfile"
-      - "test/Dockerfile.frpc"
-      - "test/Dockerfile.frps"
       - "test/compat/**"
-      - "test/ws-echo/**"
+      - "test/regression/**"
       - ".github/workflows/ci.yml"
 
 concurrency:
@@ -70,7 +66,7 @@ jobs:
       - run: go vet ./...
 
   e2e:
-    name: E2E Tests (Docker)
+    name: E2E Tests
     runs-on: arc-runner-set-drp
     container: catthehacker/ubuntu:act-latest
     needs: test
@@ -81,10 +77,18 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: E2E Tests
-        run: go test ./test/ -v -timeout 300s
+      - name: Cache frp binaries
+        uses: actions/cache@v4
+        with:
+          path: /tmp/drp-frp-cache
+          key: frp-${{ runner.os }}-${{ runner.arch }}-v0.68.0
 
       - name: Compat Tests (drps vs frps)
         env:
-          COMPAT_SERIAL: "1"
-        run: go test ./test/compat/... -v -timeout 900s
+          DRP_FRP_CACHE: /tmp/drp-frp-cache
+        run: go test ./test/compat/... -v -timeout 300s
+
+      - name: Regression Tests (drps-only)
+        env:
+          DRP_FRP_CACHE: /tmp/drp-frp-cache
+        run: go test ./test/regression/... -v -timeout 300s
