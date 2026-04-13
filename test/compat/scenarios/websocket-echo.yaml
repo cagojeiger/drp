@@ -6,8 +6,8 @@ frpc:
   proxies:
     - name: ws
       type: http
-      localIP: ws-echo
-      localPort: 9090
+      localIP: "127.0.0.1"
+      localPort: 0
       customDomains: ["ws.local"]
 request:
   method: GET

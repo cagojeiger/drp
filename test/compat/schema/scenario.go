@@ -26,6 +26,16 @@ type Scenario struct {
 	Request            RequestSpec  `yaml:"request"`
 	Expect             ExpectSpec   `yaml:"expect"`
 	ExpectedDivergence []Divergence `yaml:"expected_divergence,omitempty"`
+	Load               *Load        `yaml:"load,omitempty"`
+}
+
+// Load defines optional load/burst parameters for the scenario.
+// When present, the compat runner sends Total requests at Concurrency
+// parallelism and compares aggregate error rates between drps and frps.
+// When nil (omitted from YAML), a single request is sent.
+type Load struct {
+	Total       int `yaml:"total"`
+	Concurrency int `yaml:"concurrency"`
 }
 
 // UpstreamSpec identifies the backend kind and optional nginx config.
