@@ -15,7 +15,7 @@ import (
 
 	"github.com/kangheeyong/drp/test/compat/capture"
 	"github.com/kangheeyong/drp/test/compat/compare"
-	"github.com/kangheeyong/drp/test/compat/framework"
+	"github.com/kangheeyong/drp/test/framework"
 	"github.com/kangheeyong/drp/test/compat/schema"
 )
 
