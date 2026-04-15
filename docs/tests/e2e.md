@@ -9,7 +9,7 @@
 ## 환경
 
 ```
-프로세스 기반 테스트 인프라 (test/compat/framework/):
+프로세스 기반 테스트 인프라 (test/framework/):
   - drps: go build ./cmd/drps/ (TestMain 에서 1회)
   - frps/frpc: GitHub releases v0.68.0 다운로드 (캐시: $DRP_FRP_CACHE)
   - backend: in-process HTTP echo / WS echo (goroutine)
@@ -132,7 +132,7 @@ flowchart TB
         reg_runner[regression_test.go]
     end
 
-    subgraph fw["test/compat/framework/"]
+    subgraph fw["test/framework/"]
         port[port.go<br/>mod 파티셔닝]
         process[process.go<br/>exec.Command + SafeBuffer]
         backend[backend.go<br/>in-process HTTP/WS echo]

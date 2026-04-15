@@ -1,6 +1,6 @@
 // Package regression provides drps-only E2E tests — metrics, auth,
 // concurrency, and burst scenarios that do not require frps comparison.
-// Uses the process-based framework from test/compat/framework/.
+// Uses the process-based framework from test/framework/.
 package regression
 
 import (
@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kangheeyong/drp/test/compat/framework"
+	"github.com/kangheeyong/drp/test/framework"
 )
 
 var (

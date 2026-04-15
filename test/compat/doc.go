@@ -4,7 +4,7 @@
 // (process-based, no Docker required) and their responses are compared for
 // semantic equivalence: status code, body hash, headers, WebSocket frames.
 //
-// The test infrastructure lives in framework/ and uses patterns adopted from
+// The test infrastructure lives in test/framework/ and uses patterns adopted from
 // frp's own E2E suite: exec.Command process management, mod-partitioned
 // port allocation, in-process mock backends, and stdout readiness polling.
 //
